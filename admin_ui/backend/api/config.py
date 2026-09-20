@@ -37,6 +37,7 @@ except ModuleNotFoundError:
     # Source checkout/tests: import the same canonical module from root src/.
     from src.config_apply import classify_config_change
 
+from src.fish_audio_url import validate_fish_audio_base_url
 from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
 
 # A11: Maximum number of backups to keep
@@ -1984,8 +1985,6 @@ async def test_provider_connection(request: ProviderTestRequest):
             if not api_key:
                 return {"success": False, "message": "Fish Audio API key is not configured"}
             try:
-                from src.pipelines.fish_audio import validate_fish_audio_base_url
-
                 base_url = validate_fish_audio_base_url(
                     str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
                 )
@@ -3614,8 +3613,6 @@ async def verify_provider_credentials(provider_key: str):
         if kind == "fishaudio":
             if not api_key:
                 raise HTTPException(status_code=400, detail="Fish Audio API key is not configured")
-            from src.pipelines.fish_audio import validate_fish_audio_base_url
-
             base_url = validate_fish_audio_base_url(
                 str(provider_cfg.get("base_url") or "https://api.fish.audio/v1")
             )

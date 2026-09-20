@@ -12,12 +12,10 @@ API Reference: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to
 from __future__ import annotations
 
 import io
-import ipaddress
 import time
 import uuid
 import wave
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
-from urllib.parse import urlparse
 
 import aiohttp
 
@@ -27,6 +25,7 @@ from ..audio import (
     resolve_output_resampler_policy,
 )
 from ..config import AppConfig, FishAudioProviderConfig
+from ..fish_audio_url import validate_fish_audio_base_url
 from ..logging_config import get_logger
 from .base import TTSComponent
 
@@ -38,38 +37,6 @@ FISH_AUDIO_SAMPLE_RATES = (8000, 16000, 24000, 32000, 44100)
 FISH_AUDIO_FALLBACK_SAMPLE_RATE = 16000
 # Size of the HTTP reads while the response is still streaming.
 FISH_AUDIO_READ_BYTES = 4096
-
-
-def validate_fish_audio_base_url(base_url: str) -> str:
-    """Normalize a Fish Audio endpoint and reject unsafe clear-text URLs.
-
-    Bearer credentials may be sent to HTTPS endpoints. Plain HTTP is accepted
-    only for an explicit loopback host so the bundled local mock remains usable
-    without allowing API keys to cross the network in clear text.
-    """
-    normalized = str(base_url or "").strip().rstrip("/")
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise RuntimeError("Fish Audio base_url must be an absolute HTTP(S) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise RuntimeError(
-            "Fish Audio base_url must not contain credentials, query, or fragment"
-        )
-    if parsed.scheme == "https":
-        return normalized
-
-    hostname = parsed.hostname.lower()
-    is_loopback = hostname == "localhost"
-    if not is_loopback:
-        try:
-            is_loopback = ipaddress.ip_address(hostname).is_loopback
-        except ValueError:
-            is_loopback = False
-    if not is_loopback:
-        raise RuntimeError(
-            "Fish Audio base_url must use HTTPS; HTTP is allowed only for a loopback mock"
-        )
-    return normalized
 
 
 class FishAudioTTSAdapter(TTSComponent):
