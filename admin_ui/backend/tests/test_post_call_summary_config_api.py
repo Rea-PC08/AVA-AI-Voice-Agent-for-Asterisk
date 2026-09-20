@@ -395,6 +395,86 @@ async def test_fish_audio_credentials_verify_rejects_nonofficial_remote_host(mon
 
 
 @pytest.mark.asyncio
+async def test_fish_audio_credentials_verify_uses_fixed_bundled_mock_endpoint(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        config_api,
+        "_read_merged_config_dict",
+        lambda: {
+            "providers": {
+                "fishaudio_tts": {
+                    "type": "fishaudio",
+                    "api_key": "mock-key",
+                    "base_url": "http://localhost:8788/v1",
+                }
+            }
+        },
+    )
+
+    response = await config_api.verify_provider_credentials("fishaudio_tts")
+
+    assert response["status"] == "success"
+    assert calls[0][0] == "http://127.0.0.1:8788/model"
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_credentials_verify_rejects_other_loopback_port(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        config_api,
+        "_read_merged_config_dict",
+        lambda: {
+            "providers": {
+                "fishaudio_tts": {
+                    "type": "fishaudio",
+                    "api_key": "mock-key",
+                    "base_url": "http://127.0.0.1:9999/v1",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await config_api.verify_provider_credentials("fishaudio_tts")
+
+    assert exc_info.value.status_code == 400
+    assert "port 8788" in str(exc_info.value.detail)
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_fish_audio_provider_connection_test_verifies_configured_key(monkeypatch):
     calls = []
 

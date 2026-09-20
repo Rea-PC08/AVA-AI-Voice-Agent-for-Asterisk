@@ -37,7 +37,7 @@ except ModuleNotFoundError:
     # Source checkout/tests: import the same canonical module from root src/.
     from src.config_apply import classify_config_change
 
-from src.fish_audio_url import validate_fish_audio_base_url
+from src.fish_audio_url import fish_audio_verification_url
 from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
 
 # A11: Maximum number of backups to keep
@@ -1985,20 +1985,9 @@ async def test_provider_connection(request: ProviderTestRequest):
             if not api_key:
                 return {"success": False, "message": "Fish Audio API key is not configured"}
             try:
-                base_url = validate_fish_audio_base_url(
+                model_url = fish_audio_verification_url(
                     str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
                 )
-                parsed = urlparse(base_url)
-                hostname = (parsed.hostname or '').lower()
-                if hostname == 'api.fish.audio':
-                    model_url = 'https://api.fish.audio/model'
-                elif hostname in {'localhost', '127.0.0.1', '::1'}:
-                    model_url = f"{parsed.scheme}://{parsed.netloc}/model"
-                else:
-                    return {
-                        "success": False,
-                        "message": "Credential verification supports only api.fish.audio or a loopback mock",
-                    }
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(
                         model_url,
@@ -3613,20 +3602,9 @@ async def verify_provider_credentials(provider_key: str):
         if kind == "fishaudio":
             if not api_key:
                 raise HTTPException(status_code=400, detail="Fish Audio API key is not configured")
-            base_url = validate_fish_audio_base_url(
+            model_url = fish_audio_verification_url(
                 str(provider_cfg.get("base_url") or "https://api.fish.audio/v1")
             )
-            parsed = urlparse(base_url)
-            hostname = (parsed.hostname or "").lower()
-            if hostname == "api.fish.audio":
-                model_url = "https://api.fish.audio/model"
-            elif hostname in {"localhost", "127.0.0.1", "::1"}:
-                model_url = f"{parsed.scheme}://{parsed.netloc}/model"
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Credential verification supports only api.fish.audio or a loopback mock",
-                )
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     model_url,

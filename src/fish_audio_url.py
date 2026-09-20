@@ -6,6 +6,10 @@ import ipaddress
 from urllib.parse import urlparse
 
 
+FISH_AUDIO_OFFICIAL_VERIFICATION_URL = "https://api.fish.audio/model"
+FISH_AUDIO_MOCK_VERIFICATION_URL = "http://127.0.0.1:8788/model"
+
+
 def validate_fish_audio_base_url(base_url: str) -> str:
     """Normalize a Fish Audio endpoint and reject unsafe clear-text URLs.
 
@@ -36,3 +40,33 @@ def validate_fish_audio_base_url(base_url: str) -> str:
             "Fish Audio base_url must use HTTPS; HTTP is allowed only for a loopback mock"
         )
     return normalized
+
+
+def fish_audio_verification_url(base_url: str) -> str:
+    """Return a fixed allowlisted endpoint for credential verification.
+
+    Verification deliberately does not interpolate any user-controlled URL
+    component. The only local exception is the bundled mock's fixed loopback
+    address and port; synthesis itself may still use another validated
+    loopback URL when exercised directly.
+    """
+    normalized = validate_fish_audio_base_url(base_url)
+    parsed = urlparse(normalized)
+    hostname = (parsed.hostname or "").lower()
+
+    if (
+        parsed.scheme == "https"
+        and hostname == "api.fish.audio"
+        and parsed.port in {None, 443}
+    ):
+        return FISH_AUDIO_OFFICIAL_VERIFICATION_URL
+    if (
+        parsed.scheme == "http"
+        and hostname in {"localhost", "127.0.0.1", "::1"}
+        and parsed.port == 8788
+    ):
+        return FISH_AUDIO_MOCK_VERIFICATION_URL
+    raise RuntimeError(
+        "Credential verification supports only api.fish.audio or the bundled "
+        "loopback mock on port 8788"
+    )
