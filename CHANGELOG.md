@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native Fish Audio modular TTS provider** ([#653](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/653), contributed by [@Rea-PC08](https://github.com/Rea-PC08)): streams Fish Audio PCM progressively at the negotiated call rate, supports provider-scoped managed API keys and Admin UI configuration, enforces encrypted remote endpoints, and bounds connection and stalled-stream waits without cutting off a healthy long synthesis. **Test Connection** performs a short real synthesis so model entitlement, account-credit, and empty-audio failures are caught before a call. The Admin UI exposes the supported models as a closed dropdown and keeps registered provider settings out of the additional-fields editor, preventing stale duplicate values from overriding structured choices. CI guards catalog, default, sample-config, and documentation consistency. The bundled loopback mock covers credential, streaming, timeout, cancellation, and error paths without requiring an account.
+
 ### Fixed
 
 - **Deferred transfers fail closed when caller-facing audio cannot drain** ([#662](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/662)): the transfer-specific drain result is now authoritative, its default safety ceiling is 15 seconds, and the Admin UI exposes both the ceiling and quiet-period controls. If queued handoff audio still cannot drain, AVA cancels the exact pending action, tears down any unbridged pre-dial leg, flushes stale output, and resumes the active AI voice with an apology instead of committing a transfer that truncates speech.

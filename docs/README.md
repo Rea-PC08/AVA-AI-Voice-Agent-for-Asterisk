@@ -37,6 +37,7 @@
 - **[Telnyx AI Inference Setup](Provider-Telnyx-Setup.md)** - OpenAI-compatible LLM via Telnyx
 - **[Azure Speech Service Setup](Provider-Azure-Setup.md)** - Azure STT & TTS pipeline adapters
 - **[MiniMax LLM Setup](Provider-MiniMax-Setup.md)** - MiniMax M3 LLM via OpenAI-compatible API
+- **[Fish Audio TTS Setup](Provider-FishAudio-Setup.md)** - Streaming PCM modular TTS with managed credentials
 - **[Multi-Instance Full-Agent Providers](Multi-Instance-Full-Agent-Providers.md)** - Run multiple instances of the same provider type with isolated credentials
 
 ## Local AI & GPU Setup

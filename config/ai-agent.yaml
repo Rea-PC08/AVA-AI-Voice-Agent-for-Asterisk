@@ -117,8 +117,8 @@ pipelines:
           sample_rate: 8000
     stt: local_stt
     tts: local_tts
-  # Local STT + OpenAI LLM + ElevenLabs TTS (premium voice quality)
-  # Requires: ELEVENLABS_API_KEY + OPENAI_API_KEY in .env
+  # Local STT + OpenAI LLM + Fish Audio TTS
+  # Requires: FISH_AUDIO_API_KEY + OPENAI_API_KEY in .env
   hybrid_fishaudio:
     stt: local_stt
     llm: openai_llm
@@ -139,6 +139,8 @@ pipelines:
           encoding: mulaw
           sample_rate: 8000
   hybrid_elevenlabs:
+    # Local STT + OpenAI LLM + ElevenLabs TTS (premium voice quality)
+    # Requires: ELEVENLABS_API_KEY + OPENAI_API_KEY in .env
     stt: local_stt
     llm: openai_llm
     tts: elevenlabs_tts
@@ -568,7 +570,8 @@ providers:
     normalize: true
     temperature: 0.7
     top_p: 0.7
-    request_timeout_sec: 15
+    connect_timeout_sec: 10
+    read_timeout_sec: 30
   openai_stt:
     enabled: false
     capabilities:

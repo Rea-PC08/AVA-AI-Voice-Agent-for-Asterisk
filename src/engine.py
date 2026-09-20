@@ -16654,10 +16654,17 @@ class Engine:
                                         yield fragment
 
                                 async def _drain_tts_stream():
-                                    async for tts_chunk in pipeline.tts_adapter.synthesize_stream(
+                                    stream = pipeline.tts_adapter.synthesize_stream(
                                         call_id, _text_fragments(), pipeline.tts_options,
-                                    ):
-                                        await _deliver_tts_chunk(tts_chunk)
+                                    )
+                                    try:
+                                        async for tts_chunk in stream:
+                                            await _deliver_tts_chunk(tts_chunk)
+                                    finally:
+                                        aclose = getattr(stream, "aclose", None)
+                                        if callable(aclose):
+                                            with contextlib.suppress(Exception):
+                                                await aclose()
 
                                 tts_stream_task = asyncio.ensure_future(_drain_tts_stream())
                                 logger.info(
@@ -16670,6 +16677,11 @@ class Engine:
                                 """Send one text fragment to the voice."""
                                 if text_q is not None:
                                     await text_q.put(fragment)
+                                    # Give the consumer a chance to fail, then surface
+                                    # interruption/provider errors before consuming more LLM text.
+                                    await asyncio.sleep(0)
+                                    if tts_stream_task is not None and tts_stream_task.done():
+                                        tts_stream_task.result()
                                     return
                                 async for tts_chunk in pipeline.tts_adapter.synthesize(
                                     call_id, fragment, pipeline.tts_options,
@@ -16738,12 +16750,11 @@ class Engine:
                             # Don't return — fall through to serial path below
                             full_response_text = ""
                         finally:
-                            if tts_stream_task is not None and not tts_stream_task.done():
-                                tts_stream_task.cancel()
-                                try:
+                            if tts_stream_task is not None:
+                                if not tts_stream_task.done():
+                                    tts_stream_task.cancel()
+                                with contextlib.suppress(BaseException):
                                     await tts_stream_task
-                                except BaseException:  # cleanup only
-                                    pass
                             try:
                                 self._assign_session_provider(session, old_provider_name)
                                 await self.session_store.upsert_call(session)

@@ -52,7 +52,7 @@ CHUNK_MS = int(os.getenv("FISH_MOCK_CHUNK_MS", "40"))
 LOCAL_AI_WS = os.getenv("FISH_MOCK_LOCAL_WS", "")
 
 # Mirrors the documented Fish Audio contract.
-SUPPORTED_RATES = (8000, 16000, 24000, 32000, 44100, 48000)
+SUPPORTED_RATES = (8000, 16000, 24000, 32000, 44100)
 SUPPORTED_FORMATS = ("pcm", "wav", "mp3", "opus")
 SERVED_FORMATS = ("pcm", "wav")
 # Rates a local AI server typically offers, when one is configured.
@@ -169,8 +169,15 @@ class FishAudioMockHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802 - http.server API
-        if self.path.startswith("/v1/wallet"):
-            self._json(200, {"credit": "42.0"})
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer ") or len(authorization) <= len("Bearer "):
+            self._json(401, {"detail": "Unauthorized"})
+            return
+        if self.path.startswith("/model"):
+            self._json(
+                200,
+                {"total": 1, "items": [{"_id": "mock-voice", "title": "Mock Voice"}]},
+            )
             return
         self._json(404, {"detail": "Not Found"})
 
@@ -194,9 +201,12 @@ class FishAudioMockHandler(BaseHTTPRequestHandler):
 
         text = str(body.get("text") or "")
         audio_format = str(body.get("format") or "mp3").lower()
-        log("POST /v1/tts model=%s format=%s sample_rate=%s latency=%s reference_id=%s text=%r"
-            % (self.headers.get("model", "(none)"), audio_format, body.get("sample_rate"),
-               body.get("latency", "normal"), body.get("reference_id"), text[:60]))
+        sample_rate = body.get("sample_rate")
+        model = self.headers.get("model", "(none)")
+
+        log("POST /v1/tts model=%s format=%s sample_rate=%s latency=%s reference_id=%s text_length=%d"
+            % (model, audio_format, sample_rate, body.get("latency", "normal"),
+               body.get("reference_id"), len(text)))
 
         sample_rate, error = validate_request(body)
         if error:
@@ -310,7 +320,11 @@ async def realtime_handler(connection) -> None:
                         await asyncio.sleep(3.0)
                     else:
                         await asyncio.sleep(FIRST_BYTE_DELAY_SEC)
-                    audio = b"" if "FISH_MOCK_EMPTY" in text else synthesize(text, sample_rate)
+                    audio = (
+                        b""
+                        if "FISH_MOCK_EMPTY" in text
+                        else await asyncio.to_thread(synthesize, text, sample_rate)
+                    )
                     chunk_bytes = max(2, int(sample_rate * (CHUNK_MS / 1000.0)) * 2)
                     for offset in range(0, len(audio), chunk_bytes):
                         await connection.send(pack({
@@ -318,7 +332,10 @@ async def realtime_handler(connection) -> None:
                             "audio": audio[offset:offset + chunk_bytes],
                         }))
                         await asyncio.sleep(CHUNK_MS / 4000.0)
-                    log("realtime: %s -> %d bytes for %r" % (name, len(audio), text[:50]))
+                    log(
+                        "realtime: %s -> %d bytes (text_length=%d)"
+                        % (name, len(audio), len(text))
+                    )
                 if name == "stop":
                     await connection.send(pack({"event": "finish", "reason": "stop"}))
                     return

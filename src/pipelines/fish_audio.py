@@ -21,6 +21,7 @@ API Reference:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import time
 import uuid
@@ -35,13 +36,14 @@ from ..audio import (
     resolve_output_resampler_policy,
 )
 from ..config import AppConfig, FishAudioProviderConfig
+from ..fish_audio_url import validate_fish_audio_base_url, validate_fish_audio_ws_url
 from ..logging_config import get_logger
 from .base import TTSComponent
 
 logger = get_logger(__name__)
 
 # Sample rates Fish Audio accepts for raw PCM and WAV output.
-FISH_AUDIO_SAMPLE_RATES = (8000, 16000, 24000, 32000, 44100, 48000)
+FISH_AUDIO_SAMPLE_RATES = (8000, 16000, 24000, 32000, 44100)
 # Used when the negotiated transport rate is not one the provider can emit.
 FISH_AUDIO_FALLBACK_SAMPLE_RATE = 16000
 # Size of the HTTP reads while the response is still streaming.
@@ -106,7 +108,9 @@ class FishAudioTTSAdapter(TTSComponent):
         self._session_factory = session_factory
         self._session: Optional[aiohttp.ClientSession] = None
         # The engine feeds text progressively only when the realtime transport is on.
-        self.supports_text_stream = self._compose_options({})["transport"] == "websocket"
+        self.supports_text_stream = (
+            str(self._compose_options({})["transport"]).strip().lower() == "websocket"
+        )
 
     async def start(self) -> None:
         logger.debug(
@@ -166,9 +170,12 @@ class FishAudioTTSAdapter(TTSComponent):
             merged.get("sample_rate"), target_sample_rate
         )
 
+        # Validate before constructing Authorization headers or entering the
+        # request path, so a bearer key cannot reach a non-loopback HTTP host.
+        base_url = validate_fish_audio_base_url(str(merged["base_url"]))
         payload = self._build_request(merged, source_sample_rate, audio_format, text=text)
         headers = self._build_headers(api_key, merged)
-        url = str(merged["base_url"]).rstrip("/") + "/tts"
+        url = base_url + "/tts"
         request_id = "fish-tts-" + uuid.uuid4().hex[:12]
         chunk_ms = int(merged.get("chunk_size_ms", 20))
 
@@ -176,7 +183,7 @@ class FishAudioTTSAdapter(TTSComponent):
             "Fish Audio TTS synthesis started",
             call_id=call_id,
             request_id=request_id,
-            text_preview=text[:64],
+            text_length=len(text),
             model=merged["model"],
             reference_id=merged.get("reference_id"),
             latency=merged["latency"],
@@ -189,22 +196,34 @@ class FishAudioTTSAdapter(TTSComponent):
         first_audio_ms: Optional[float] = None
         output_bytes = 0
 
-        # Bound the whole exchange: a hung provider must not hold the turn open.
-        timeout = aiohttp.ClientTimeout(total=float(merged["request_timeout_sec"]))
+        # Bound connection establishment and gaps between response chunks while
+        # allowing a healthy long synthesis to stream for as long as needed.
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=float(merged["connect_timeout_sec"]),
+            sock_connect=float(merged["connect_timeout_sec"]),
+            sock_read=float(merged["read_timeout_sec"]),
+        )
         try:
             async with self._session.post(
-                url, json=payload, headers=headers, timeout=timeout
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
             ) as response:
-                if response.status >= 400:
-                    body = await response.text()
+                if response.status >= 300:
                     logger.error(
                         "Fish Audio TTS synthesis failed",
                         call_id=call_id,
                         request_id=request_id,
                         status=response.status,
-                        body=body[:200],
                     )
-                    response.raise_for_status()
+                    if response.status >= 400:
+                        response.raise_for_status()
+                    raise RuntimeError(
+                        f"Fish Audio TTS returned unexpected HTTP {response.status}"
+                    )
 
                 if audio_format == "pcm" and source_sample_rate == target_sample_rate:
                     # The provider rate already matches the call: convert and forward
@@ -260,6 +279,9 @@ class FishAudioTTSAdapter(TTSComponent):
                             output_bytes += len(chunk)
                             yield chunk
 
+            if output_bytes == 0:
+                raise RuntimeError("Fish Audio TTS returned no audio")
+
             logger.info(
                 "Fish Audio TTS synthesis completed",
                 call_id=call_id,
@@ -294,14 +316,13 @@ class FishAudioTTSAdapter(TTSComponent):
         when the realtime transport is not selected.
         """
         merged = self._compose_options(options)
-        if str(merged["transport"]).lower() != "websocket":
+        if str(merged["transport"]).strip().lower() != "websocket":
             async for text in text_chunks:
                 async for chunk in self.synthesize(call_id, text, options):
                     yield chunk
             return
 
         api_key = self._require_api_key(merged)
-        pack, unpack = _load_msgpack()
         await self._ensure_session()
 
         target_encoding = merged["format"]["encoding"]
@@ -313,6 +334,9 @@ class FishAudioTTSAdapter(TTSComponent):
         emit_size = self._chunk_size_bytes(target_encoding, target_sample_rate, chunk_ms)
         request_id = "fish-tts-" + uuid.uuid4().hex[:12]
         url = self._websocket_url(merged)
+        # Validate the destination before loading the protocol codec or building
+        # any credential-bearing connection arguments.
+        pack, unpack = _load_msgpack()
 
         logger.info(
             "Fish Audio realtime session opening",
@@ -334,6 +358,10 @@ class FishAudioTTSAdapter(TTSComponent):
         pending = bytearray()
         resample_state = None
         sender: Optional[asyncio.Task] = None
+        receive_task: Optional[asyncio.Task] = None
+        messages = None
+        websocket_context = None
+        websocket_entered = False
 
         async def feed(websocket) -> None:
             """Send each fragment as it is produced, then close the text stream."""
@@ -350,19 +378,33 @@ class FishAudioTTSAdapter(TTSComponent):
             finally:
                 with_stop = {"event": "stop"}
                 try:
-                    await websocket.send_bytes(pack(with_stop))
-                except Exception:  # noqa: BLE001 - the socket may already be gone
+                    await asyncio.wait_for(
+                        websocket.send_bytes(pack(with_stop)),
+                        timeout=connect_timeout,
+                    )
+                except BaseException:  # cleanup only; the socket may already be gone
                     pass
 
-        timeout = aiohttp.ClientTimeout(total=float(merged["request_timeout_sec"]))
+        connect_timeout = float(merged["connect_timeout_sec"])
+        read_timeout = float(merged["read_timeout_sec"])
+        websocket_timeout = aiohttp.ClientWSTimeout(
+            ws_receive=read_timeout,
+            ws_close=connect_timeout,
+        )
         try:
-            async with self._session.ws_connect(
+            websocket_context = self._session.ws_connect(
                 url,
                 headers=self._build_headers(api_key, merged),
-                timeout=timeout,
+                timeout=websocket_timeout,
                 heartbeat=20,
                 max_msg_size=0,
-            ) as websocket:
+            )
+            websocket = await asyncio.wait_for(
+                websocket_context.__aenter__(),
+                timeout=connect_timeout,
+            )
+            websocket_entered = True
+            try:
                 await websocket.send_bytes(
                     pack({
                         "event": "start",
@@ -372,57 +414,89 @@ class FishAudioTTSAdapter(TTSComponent):
                     })
                 )
                 sender = asyncio.ensure_future(feed(websocket))
+                monitored_sender: Optional[asyncio.Task] = sender
+                messages = websocket.__aiter__()
+                receive_task = asyncio.create_task(
+                    asyncio.wait_for(messages.__anext__(), timeout=read_timeout)
+                )
+                finished = False
 
-                async for message in websocket:
+                while True:
+                    wait_for = {receive_task}
+                    if monitored_sender is not None:
+                        wait_for.add(monitored_sender)
+                    done, _ = await asyncio.wait(
+                        wait_for,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if monitored_sender is not None and monitored_sender in done:
+                        # Retrieve and propagate text-source or socket-send failures
+                        # immediately instead of leaving the receive loop blocked.
+                        monitored_sender.result()
+                        monitored_sender = None
+
+                    if receive_task not in done:
+                        continue
+                    try:
+                        message = receive_task.result()
+                    except StopAsyncIteration as exc:
+                        raise RuntimeError(
+                            "Fish Audio realtime socket closed before a finish event"
+                        ) from exc
+                    receive_task = None
+
                     if message.type is aiohttp.WSMsgType.BINARY:
                         event = unpack(message.data)
                     elif message.type is aiohttp.WSMsgType.TEXT:
-                        continue
+                        event = None
                     elif message.type in (
                         aiohttp.WSMsgType.CLOSED,
                         aiohttp.WSMsgType.CLOSING,
                         aiohttp.WSMsgType.CLOSE,
                     ):
-                        break
+                        raise RuntimeError(
+                            "Fish Audio realtime socket closed before a finish event"
+                        )
                     elif message.type is aiohttp.WSMsgType.ERROR:
                         raise RuntimeError("Fish Audio realtime socket error")
                     else:
-                        continue
+                        event = None
 
-                    if not isinstance(event, dict):
-                        continue
-                    name = event.get("event")
+                    name = event.get("event") if isinstance(event, dict) else None
                     if name == "audio":
                         data = carry + (event.get("audio") or b"")
                         aligned = len(data) - (len(data) % 2)
                         carry = data[aligned:]
-                        if not aligned:
-                            continue
-                        pcm = data[:aligned]
-                        if source_sample_rate != target_sample_rate:
-                            pcm, resample_state = resample_audio(
-                                pcm,
-                                source_sample_rate,
-                                target_sample_rate,
-                                mode=merged["output_resampler"],
-                                state=resample_state,
+                        if aligned:
+                            pcm = data[:aligned]
+                            if source_sample_rate != target_sample_rate:
+                                pcm, resample_state = resample_audio(
+                                    pcm,
+                                    source_sample_rate,
+                                    target_sample_rate,
+                                    mode=merged["output_resampler"],
+                                    state=resample_state,
+                                )
+                            pending.extend(
+                                convert_pcm16le_to_target_format(pcm, target_encoding)
                             )
-                        pending.extend(
-                            convert_pcm16le_to_target_format(pcm, target_encoding)
-                        )
-                        if first_audio_ms is None and pending:
-                            first_audio_ms = (time.perf_counter() - started_at) * 1000.0
-                        while len(pending) >= emit_size:
-                            chunk = bytes(pending[:emit_size])
-                            del pending[:emit_size]
-                            output_bytes += len(chunk)
-                            yield chunk
+                            if first_audio_ms is None and pending:
+                                first_audio_ms = (
+                                    time.perf_counter() - started_at
+                                ) * 1000.0
+                            while len(pending) >= emit_size:
+                                chunk = bytes(pending[:emit_size])
+                                del pending[:emit_size]
+                                output_bytes += len(chunk)
+                                yield chunk
                     elif name == "finish":
                         reason = event.get("reason")
                         if reason == "error":
                             raise RuntimeError(
                                 "Fish Audio realtime session finished with an error"
                             )
+                        finished = True
                         break
                     elif name == "log":
                         logger.debug(
@@ -432,9 +506,37 @@ class FishAudioTTSAdapter(TTSComponent):
                             message=str(event.get("message"))[:200],
                         )
 
+                    receive_task = asyncio.create_task(
+                        asyncio.wait_for(messages.__anext__(), timeout=read_timeout)
+                    )
+
+                if not finished:
+                    raise RuntimeError(
+                        "Fish Audio realtime socket closed before a finish event"
+                    )
+
+                # A conforming server sends finish only after the client stop event.
+                # Surface a sender failure even if finish and that failure raced.
+                if sender is not None and sender.done():
+                    sender.result()
+
                 if pending:
                     output_bytes += len(pending)
                     yield bytes(pending)
+
+                if output_bytes == 0:
+                    raise RuntimeError("Fish Audio TTS returned no audio")
+
+            finally:
+                if receive_task is not None:
+                    if not receive_task.done():
+                        receive_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await receive_task
+                close_messages = getattr(messages, "aclose", None)
+                if close_messages is not None:
+                    with contextlib.suppress(BaseException):
+                        await close_messages()
 
             logger.info(
                 "Fish Audio realtime session completed",
@@ -446,6 +548,16 @@ class FishAudioTTSAdapter(TTSComponent):
                 output_bytes=output_bytes,
             )
 
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "Fish Audio realtime session timed out",
+                call_id=call_id,
+                request_id=request_id,
+                read_timeout_sec=read_timeout,
+            )
+            raise RuntimeError(
+                "Fish Audio realtime session timed out waiting for a provider event"
+            ) from exc
         except aiohttp.ClientError as exc:
             logger.error(
                 "Fish Audio realtime connection error",
@@ -455,12 +567,14 @@ class FishAudioTTSAdapter(TTSComponent):
             )
             raise
         finally:
-            if sender is not None and not sender.done():
-                sender.cancel()
-                try:
+            if sender is not None:
+                if not sender.done():
+                    sender.cancel()
+                with contextlib.suppress(BaseException):
                     await sender
-                except (asyncio.CancelledError, Exception):  # noqa: B014 - cleanup only
-                    pass
+            if websocket_context is not None and websocket_entered:
+                with contextlib.suppress(BaseException):
+                    await websocket_context.__aexit__(None, None, None)
 
     def _require_api_key(self, merged: Dict[str, Any]) -> str:
         api_key = merged.get("api_key")
@@ -496,8 +610,11 @@ class FishAudioTTSAdapter(TTSComponent):
             "top_p": float(merged["top_p"]),
         }
         reference_id = merged.get("reference_id")
-        if reference_id:
-            request["reference_id"] = reference_id
+        if not reference_id:
+            raise RuntimeError(
+                "Fish Audio TTS requires a reference_id (voice model ID)"
+            )
+        request["reference_id"] = reference_id
         prosody: Dict[str, Any] = {}
         if merged.get("speed") is not None:
             prosody["speed"] = float(merged["speed"])
@@ -509,11 +626,15 @@ class FishAudioTTSAdapter(TTSComponent):
 
     def _websocket_url(self, merged: Dict[str, Any]) -> str:
         configured = merged.get("ws_base_url")
-        base = str(configured or merged["base_url"]).rstrip("/")
-        if base.startswith("https://"):
-            base = "wss://" + base[len("https://"):]
-        elif base.startswith("http://"):
-            base = "ws://" + base[len("http://"):]
+        if configured:
+            base = validate_fish_audio_ws_url(str(configured))
+        else:
+            http_base = validate_fish_audio_base_url(str(merged["base_url"]))
+            if http_base.startswith("https://"):
+                base = "wss://" + http_base[len("https://"):]
+            else:
+                base = "ws://" + http_base[len("http://"):]
+            base = validate_fish_audio_ws_url(base)
         if base.endswith(FISH_AUDIO_WS_PATH):
             return base
         return base + FISH_AUDIO_WS_PATH
@@ -597,8 +718,11 @@ class FishAudioTTSAdapter(TTSComponent):
                 ),
             },
             "chunk_size_ms": pick("chunk_size_ms", 20),
-            "request_timeout_sec": pick(
-                "request_timeout_sec", self._provider_config.request_timeout_sec
+            "connect_timeout_sec": pick(
+                "connect_timeout_sec", self._provider_config.connect_timeout_sec
+            ),
+            "read_timeout_sec": pick(
+                "read_timeout_sec", self._provider_config.read_timeout_sec
             ),
             "output_resampler": pick(
                 "output_resampler", self._provider_config.output_resampler
