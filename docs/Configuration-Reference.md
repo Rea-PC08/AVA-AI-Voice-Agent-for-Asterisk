@@ -817,10 +817,13 @@ and forwarded while the sentence is still being synthesised.
 ```bash
 # .env
 FISH_AUDIO_API_KEY=your-api-key
+FISH_AUDIO_REFERENCE_ID=voice-model-id
 ```
 
-The provider is skipped (with a warning) when the key is missing, so a pipeline
-referencing it falls back to a placeholder adapter instead of failing the call.
+The Admin UI can instead store a provider-scoped API key in an owner-only file.
+The engine resolves `api_key_file`, `api_key_env`, an inline key, then the legacy
+`FISH_AUDIO_API_KEY` fallback. A pipeline with a missing key or voice reference
+is invalid at startup and fails closed; AVA never substitutes another TTS voice.
 
 ### Provider configuration
 
@@ -831,8 +834,8 @@ providers:
     capabilities:
       - tts
     enabled: true
-    model: s2.1-pro        # s1, s2-pro, s2.1-pro, drama-3-preview
-    reference_id: null     # voice model id from your Fish Audio library
+    model: s2.1-pro        # also: s1, s2-pro, s2.1-pro-free, drama-3-preview
+    reference_id: voice-model-id # required voice id from your Fish Audio library
     audio_format: pcm      # pcm (streamed) or wav (buffered)
     sample_rate: null      # null follows the call: 8 kHz telephony, 16 kHz wideband
     latency: low           # low, normal, balanced
@@ -842,19 +845,21 @@ providers:
     top_p: 0.7
     speed: null            # prosody.speed override
     volume: null           # prosody.volume override
-    request_timeout_sec: 15
+    connect_timeout_sec: 10
+    read_timeout_sec: 30
     output_resampler: inherit
 ```
 
 | Key | Purpose |
 |---|---|
 | `model` | Sent as the `model` HTTP header, which is how Fish Audio selects the speech model. `s2.1-pro-free` needs no API credit, which is handy for a live check. |
-| `reference_id` | Voice model id (a voice from the Fish Audio library, or one you cloned). Omit to use the account default. |
+| `reference_id` | Required voice model id (a voice from the Fish Audio library, or one you cloned). |
 | `audio_format` | `pcm` streams chunk by chunk and is recommended for calls; `wav` is read in full, then decoded. |
 | `sample_rate` | Leave `null` to follow the negotiated transport. A rate Fish Audio cannot emit falls back to 16 kHz and is resampled locally. |
 | `latency` | `low` favours time to first audio, which is what a phone call needs. |
 | `speed`, `volume` | Sent as `prosody`; leave `null` to keep the model default. |
-| `request_timeout_sec` | Whole-request budget, streamed body included. A hung provider fails the turn instead of holding it open. |
+| `connect_timeout_sec` | Maximum time to establish or acquire the HTTP connection. |
+| `read_timeout_sec` | Maximum gap between response chunks. This fails a stalled stream without imposing a deadline on healthy long synthesis. |
 
 Every key can also be set per pipeline under `options.tts`, and overridden per
 request at runtime.
@@ -897,5 +902,5 @@ through the mock. It serves a generated tone by default; set
 instead. The request text also carries hooks — `FISH_MOCK_401`,
 `FISH_MOCK_SLOW`, `FISH_MOCK_EMPTY` — to check how failures are handled.
 
-The integration test is skipped unless `FISH_AUDIO_API_KEY` is set; set
-`FISH_AUDIO_REFERENCE_ID` as well to synthesise with a specific voice.
+The integration test is skipped unless both `FISH_AUDIO_API_KEY` and
+`FISH_AUDIO_REFERENCE_ID` are set.

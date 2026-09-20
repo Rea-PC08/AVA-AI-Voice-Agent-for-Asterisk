@@ -685,10 +685,13 @@ class FishAudioProviderConfig(BaseModel):
     """
     enabled: bool = Field(default=True)
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
     base_url: str = Field(default="https://api.fish.audio/v1")
     # Speech model, sent as the `model` request header.
-    model: str = Field(default="s2.1-pro")  # s1, s2-pro, s2.1-pro, drama-3-preview
-    # Voice model id from the Fish Audio library; None uses the account default.
+    model: str = Field(default="s2.1-pro")  # also: s1, s2-pro, s2.1-pro-free, drama-3-preview
+    # Voice model id from the Fish Audio library. The adapter supports the
+    # reference_id request form, so a value is required before synthesis.
     reference_id: Optional[str] = None
     # Raw PCM streams chunk by chunk; wav is buffered and decoded.
     audio_format: Literal["pcm", "wav"] = Field(default="pcm")
@@ -703,8 +706,11 @@ class FishAudioProviderConfig(BaseModel):
     speed: Optional[float] = None
     volume: Optional[float] = None
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
-    # Whole-request budget, including the streamed body.
-    request_timeout_sec: float = Field(default=15.0, gt=0)
+    # Connection establishment and inter-chunk budgets. There is deliberately
+    # no whole-request deadline: a healthy synthesis may stream longer than the
+    # read budget in aggregate as long as audio continues arriving.
+    connect_timeout_sec: float = Field(default=10.0, gt=0)
+    read_timeout_sec: float = Field(default=30.0, gt=0)
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
 

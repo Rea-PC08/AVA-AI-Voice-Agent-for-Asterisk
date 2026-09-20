@@ -476,6 +476,27 @@ const GenericProviderForm: React.FC<GenericProviderFormProps> = ({ config, onCha
                                         }}
                                     />
                                 )}
+                                {cap === 'tts' && selectedSubtype.yamlType === 'fishaudio' && (
+                                    <ProviderCredentialsCard
+                                        providerKey={isNew ? undefined : config.name}
+                                        credentialType="api-key"
+                                        label="Fish Audio API Key"
+                                        placeholder="Paste Fish Audio API key"
+                                        envVarFallback="FISH_AUDIO_API_KEY"
+                                        inlineValue={
+                                            config.api_key ||
+                                            (config.api_key_env
+                                                ? `\${${config.api_key_env}}`
+                                                : undefined)
+                                        }
+                                        helpText="Stored in an owner-only provider-scoped file. Use Test Connection to verify it without exposing the key."
+                                        onConfigPatch={(patch) => {
+                                            const next = { ...config, ...patch };
+                                            Object.keys(next).forEach((key) => next[key] === undefined && delete next[key]);
+                                            onChange(next);
+                                        }}
+                                    />
+                                )}
                             </div>
                         )}
 

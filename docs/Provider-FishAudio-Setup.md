@@ -18,7 +18,7 @@ resample, no waiting for the full sentence.
 | Provider key | `fishaudio_tts` |
 | Models | `s1`, `s2-pro`, `s2.1-pro` (default), `drama-3-preview`, `s2.1-pro-free` (no API credit needed, for testing) |
 | Output used | `pcm` (streamed) or `wav` (buffered) |
-| Pricing | Per character, see [fish.audio](https://fish.audio) — a free tier is available for testing |
+| Pricing | Usage is measured in UTF-8 text bytes; see [Fish Audio developers](https://fish.audio/developers/) for current rates |
 | Per-agent voice | Not applicable (modular adapter); the voice is set on the provider or pipeline |
 
 ## Quick Start
@@ -27,19 +27,25 @@ resample, no waiting for the full sentence.
 
 1. Create an account on [fish.audio](https://fish.audio).
 2. Open the API keys page and create a key.
-3. Optional: browse the voice library and copy the id of the voice you want.
-   That id is the `reference_id` below; leave it empty to use your account
-   default.
+3. Browse the voice library and copy the id of the voice you want. That id is
+   the required `reference_id` below.
 
 ### 2. Configure the environment variable
 
 ```bash
 # .env
 FISH_AUDIO_API_KEY=your-api-key
+FISH_AUDIO_REFERENCE_ID=voice-model-id # legacy env-only configuration
 ```
 
-The adapter is not registered when the key is missing: a pipeline referencing it
-falls back to a placeholder adapter and logs a warning, instead of failing calls.
+You can also add or edit a Fish Audio TTS provider under **Providers** in the
+Admin UI, save it, then upload a provider-scoped API key. Managed keys are stored
+in owner-only files and are not written into YAML. **Test Connection** verifies
+the key against Fish Audio's voice-model endpoint.
+
+The adapter is not registered when the key or `reference_id` is missing. A
+pipeline referencing it is rejected at startup; AVA does not silently switch to
+another provider or voice.
 
 ### 3. Configure the provider
 
@@ -50,8 +56,8 @@ providers:
     capabilities:
       - tts
     enabled: true
-    model: s2.1-pro        # s1, s2-pro, s2.1-pro, drama-3-preview
-    reference_id: null     # voice id from your Fish Audio library
+    model: s2.1-pro        # also: s1, s2-pro, s2.1-pro-free, drama-3-preview
+    reference_id: voice-model-id # required voice id from your Fish Audio library
     audio_format: pcm      # pcm (streamed) or wav (buffered)
     sample_rate: null      # null follows the call: 8 kHz telephony, 16 kHz wideband
     latency: low           # low, normal, balanced
@@ -61,14 +67,19 @@ providers:
     top_p: 0.7
     speed: null            # prosody.speed override
     volume: null           # prosody.volume override
-    request_timeout_sec: 15 # whole-request budget, streamed body included
+    connect_timeout_sec: 10 # connection establishment/pool wait
+    read_timeout_sec: 30    # maximum gap between streamed chunks
     output_resampler: inherit
 ```
 
 `latency: low` favours time to first audio, which is what a phone call needs.
 Leave `sample_rate` at `null` unless you have a reason to force a rate: a rate
-Fish Audio cannot emit (anything outside 8, 16, 24, 32, 44.1 and 48 kHz) falls
+Fish Audio cannot emit for PCM/WAV (anything outside 8, 16, 24, 32 and 44.1 kHz) falls
 back to 16 kHz and is resampled locally.
+
+Remote endpoints must use HTTPS. Plain HTTP is accepted only for an explicit
+loopback host so the bundled mock can run without sending a bearer key over the
+network.
 
 ### 4. Configure a pipeline
 
@@ -156,8 +167,9 @@ developer balance gets `402 Payment Required` from the paid models.
 | `Unsupported Fish Audio TTS output format` | `audio_format` must be `pcm` or `wav`; mp3 and opus are not used for calls. |
 | Audio plays but sounds thin or metallic | Check the transport encoding and rate in `options.tts.format`; on 8 kHz telephony the adapter should report `source_sample_rate=8000` (no resample). |
 | First audio is slow | Try `latency: low` and a smaller `chunk_length`; check network latency to the API, and confirm the greeting is not synthesised on the caller's first turn. |
-| Turn fails after ~15 s | The request budget (`request_timeout_sec`) elapsed; the provider never finished streaming. |
-| No audio at all, no error | The service answered without audio (`output_bytes=0`); the call continues silently. Check the text sent and the account status. |
+| Turn fails while connecting | The connection budget (`connect_timeout_sec`) elapsed. |
+| Turn fails after an audio gap | No response chunk arrived within `read_timeout_sec`; healthy long streams can exceed this value in total. |
+| `Fish Audio TTS returned no audio` | The service completed without an audio payload. The current synthesis fails instead of silently playing an empty response; check the account, model, voice id, and request text. |
 
 ## References
 

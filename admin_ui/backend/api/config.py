@@ -1890,13 +1890,15 @@ async def test_provider_connection(request: ProviderTestRequest):
                     file_field="api_key_file",
                     env_field="api_key_env",
                     inline_field="api_key",
-                    legacy_env_names=_llm_legacy_env_names(provider_name, kind),
+                    legacy_env_names=_provider_legacy_api_key_env_names(provider_name, kind),
                 )
                 if resolved_key:
                     provider_config["api_key"] = resolved_key
             except Exception:
                 logger.warning("Provider connection test could not resolve managed API key")
         
+        provider_type = str(provider_config.get('type') or '').lower()
+
         # ============================================================
         # LOCAL PROVIDER - test connection to local_ai_server
         # ============================================================
@@ -1968,6 +1970,58 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
         
         # ============================================================
+        # FISH AUDIO TTS - validate the key via the official voice-model API.
+        # A loopback-only exception supports the bundled mock; verification
+        # never forwards a bearer key to an arbitrary configured HTTPS host.
+        # ============================================================
+        if provider_type == 'fishaudio':
+            api_key = (
+                str(provider_config.get('api_key') or '').strip()
+                or get_env_key('FISH_AUDIO_API_KEY')
+                or os.getenv('FISH_AUDIO_API_KEY')
+                or ''
+            )
+            if not api_key:
+                return {"success": False, "message": "Fish Audio API key is not configured"}
+            try:
+                from src.pipelines.fish_audio import validate_fish_audio_base_url
+
+                base_url = validate_fish_audio_base_url(
+                    str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
+                )
+                parsed = urlparse(base_url)
+                hostname = (parsed.hostname or '').lower()
+                if hostname == 'api.fish.audio':
+                    model_url = 'https://api.fish.audio/model'
+                elif hostname in {'localhost', '127.0.0.1', '::1'}:
+                    model_url = f"{parsed.scheme}://{parsed.netloc}/model"
+                else:
+                    return {
+                        "success": False,
+                        "message": "Credential verification supports only api.fish.audio or a loopback mock",
+                    }
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(
+                        model_url,
+                        params={"page_size": 1},
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                if response.status_code == 200:
+                    return {"success": True, "message": "Fish Audio API key verified"}
+                if response.status_code == 401:
+                    return {"success": False, "message": "Invalid Fish Audio API key (401)"}
+                return {
+                    "success": False,
+                    "message": f"Fish Audio API error: HTTP {response.status_code}",
+                }
+            except Exception:
+                logger.debug("Fish Audio provider validation failed", exc_info=True)
+                return {
+                    "success": False,
+                    "message": "Cannot connect to the configured Fish Audio endpoint",
+                }
+
+        # ============================================================
         # ELEVENLABS AGENT - check before other providers
         # ============================================================
         if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
@@ -2009,7 +2063,6 @@ async def test_provider_connection(request: ProviderTestRequest):
         # ============================================================
         # TELNYX (OpenAI-compatible) - validate /models + a tiny /chat/completions
         # ============================================================
-        provider_type = str(provider_config.get('type') or '').lower()
         chat_base_url = (provider_config.get('chat_base_url') or provider_config.get('base_url') or '').rstrip('/')
         host = _url_host(chat_base_url)
         is_telnyx = provider_type in ('telnyx', 'telenyx') or ('telnyx' in provider_name) or host == 'api.telnyx.com'
@@ -3029,6 +3082,7 @@ def _provider_legacy_api_key_env_names(provider_key: str, kind: str) -> tuple[st
         "google_live": ("GOOGLE_API_KEY",),
         "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
         "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
     }.get(kind)
     if full_agent is not None:
         return full_agent
@@ -3472,6 +3526,7 @@ async def verify_provider_credentials(provider_key: str):
         "minimax": ("MINIMAX_API_KEY",),
         "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
         "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
     }.get(kind, ())
     api_key = helpers["resolve_secret_value"](
         provider_cfg,
@@ -3556,6 +3611,34 @@ async def verify_provider_credentials(provider_key: str):
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="xAI API key verification failed")
             return {"status": "success", "message": "xAI API key verified"}
+        if kind == "fishaudio":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Fish Audio API key is not configured")
+            from src.pipelines.fish_audio import validate_fish_audio_base_url
+
+            base_url = validate_fish_audio_base_url(
+                str(provider_cfg.get("base_url") or "https://api.fish.audio/v1")
+            )
+            parsed = urlparse(base_url)
+            hostname = (parsed.hostname or "").lower()
+            if hostname == "api.fish.audio":
+                model_url = "https://api.fish.audio/model"
+            elif hostname in {"localhost", "127.0.0.1", "::1"}:
+                model_url = f"{parsed.scheme}://{parsed.netloc}/model"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Credential verification supports only api.fish.audio or a loopback mock",
+                )
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    model_url,
+                    params={"page_size": 1},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Fish Audio API key verification failed")
+            return {"status": "success", "message": "Fish Audio API key verified"}
         if kind == "google":
             if not api_key:
                 raise HTTPException(status_code=400, detail="Google API key is not configured")

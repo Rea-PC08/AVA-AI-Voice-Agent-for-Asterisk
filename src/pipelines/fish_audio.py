@@ -12,10 +12,12 @@ API Reference: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to
 from __future__ import annotations
 
 import io
+import ipaddress
 import time
 import uuid
 import wave
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -31,11 +33,43 @@ from .base import TTSComponent
 logger = get_logger(__name__)
 
 # Sample rates Fish Audio accepts for raw PCM and WAV output.
-FISH_AUDIO_SAMPLE_RATES = (8000, 16000, 24000, 32000, 44100, 48000)
+FISH_AUDIO_SAMPLE_RATES = (8000, 16000, 24000, 32000, 44100)
 # Used when the negotiated transport rate is not one the provider can emit.
 FISH_AUDIO_FALLBACK_SAMPLE_RATE = 16000
 # Size of the HTTP reads while the response is still streaming.
 FISH_AUDIO_READ_BYTES = 4096
+
+
+def validate_fish_audio_base_url(base_url: str) -> str:
+    """Normalize a Fish Audio endpoint and reject unsafe clear-text URLs.
+
+    Bearer credentials may be sent to HTTPS endpoints. Plain HTTP is accepted
+    only for an explicit loopback host so the bundled local mock remains usable
+    without allowing API keys to cross the network in clear text.
+    """
+    normalized = str(base_url or "").strip().rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("Fish Audio base_url must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError(
+            "Fish Audio base_url must not contain credentials, query, or fragment"
+        )
+    if parsed.scheme == "https":
+        return normalized
+
+    hostname = parsed.hostname.lower()
+    is_loopback = hostname == "localhost"
+    if not is_loopback:
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = False
+    if not is_loopback:
+        raise RuntimeError(
+            "Fish Audio base_url must use HTTPS; HTTP is allowed only for a loopback mock"
+        )
+    return normalized
 
 
 class FishAudioTTSAdapter(TTSComponent):
@@ -139,8 +173,11 @@ class FishAudioTTSAdapter(TTSComponent):
             "top_p": float(merged["top_p"]),
         }
         reference_id = merged.get("reference_id")
-        if reference_id:
-            payload["reference_id"] = reference_id
+        if not reference_id:
+            raise RuntimeError(
+                "Fish Audio TTS requires a reference_id (voice model ID)"
+            )
+        payload["reference_id"] = reference_id
         prosody: Dict[str, Any] = {}
         if merged.get("speed") is not None:
             prosody["speed"] = float(merged["speed"])
@@ -149,6 +186,10 @@ class FishAudioTTSAdapter(TTSComponent):
         if prosody:
             payload["prosody"] = prosody
 
+        # Validate before constructing Authorization headers or entering the
+        # request path, so a bearer key cannot reach a non-loopback HTTP host.
+        base_url = validate_fish_audio_base_url(str(merged["base_url"]))
+
         headers = {
             "Authorization": "Bearer " + str(api_key),
             "Content-Type": "application/json",
@@ -156,7 +197,6 @@ class FishAudioTTSAdapter(TTSComponent):
             "model": str(merged["model"]),
         }
 
-        base_url = str(merged["base_url"]).rstrip("/")
         url = base_url + "/tts"
         request_id = "fish-tts-" + uuid.uuid4().hex[:12]
         chunk_ms = int(merged.get("chunk_size_ms", 20))
@@ -166,7 +206,7 @@ class FishAudioTTSAdapter(TTSComponent):
             "Fish Audio TTS synthesis started",
             call_id=call_id,
             request_id=request_id,
-            text_preview=text[:64],
+            text_length=len(text),
             model=merged["model"],
             reference_id=reference_id,
             latency=merged["latency"],
@@ -179,22 +219,34 @@ class FishAudioTTSAdapter(TTSComponent):
         first_audio_ms: Optional[float] = None
         output_bytes = 0
 
-        # Bound the whole exchange: a hung provider must not hold the turn open.
-        timeout = aiohttp.ClientTimeout(total=float(merged["request_timeout_sec"]))
+        # Bound connection establishment and gaps between response chunks while
+        # allowing a healthy long synthesis to stream for as long as needed.
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=float(merged["connect_timeout_sec"]),
+            sock_connect=float(merged["connect_timeout_sec"]),
+            sock_read=float(merged["read_timeout_sec"]),
+        )
         try:
             async with self._session.post(
-                url, json=payload, headers=headers, timeout=timeout
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
             ) as response:
-                if response.status >= 400:
-                    body = await response.text()
+                if response.status >= 300:
                     logger.error(
                         "Fish Audio TTS synthesis failed",
                         call_id=call_id,
                         request_id=request_id,
                         status=response.status,
-                        body=body[:200],
                     )
-                    response.raise_for_status()
+                    if response.status >= 400:
+                        response.raise_for_status()
+                    raise RuntimeError(
+                        f"Fish Audio TTS returned unexpected HTTP {response.status}"
+                    )
 
                 if audio_format == "pcm" and source_sample_rate == target_sample_rate:
                     # The provider rate already matches the call: convert and forward
@@ -249,6 +301,9 @@ class FishAudioTTSAdapter(TTSComponent):
                         if chunk:
                             output_bytes += len(chunk)
                             yield chunk
+
+            if output_bytes == 0:
+                raise RuntimeError("Fish Audio TTS returned no audio")
 
             logger.info(
                 "Fish Audio TTS synthesis completed",
@@ -347,8 +402,11 @@ class FishAudioTTSAdapter(TTSComponent):
                 ),
             },
             "chunk_size_ms": pick("chunk_size_ms", 20),
-            "request_timeout_sec": pick(
-                "request_timeout_sec", self._provider_config.request_timeout_sec
+            "connect_timeout_sec": pick(
+                "connect_timeout_sec", self._provider_config.connect_timeout_sec
+            ),
+            "read_timeout_sec": pick(
+                "read_timeout_sec", self._provider_config.read_timeout_sec
             ),
             "output_resampler": pick(
                 "output_resampler", self._provider_config.output_resampler

@@ -190,6 +190,26 @@ const OUTPUT_RESAMPLER_FIELD: SubtypeField = {
 };
 const TTS_SUBTYPES: ProviderSubtype[] = [
   {
+    id: 'fishaudio',
+    label: 'Fish Audio',
+    description: 'Fish Audio streaming PCM text-to-speech for telephony',
+    yamlType: 'fishaudio',
+    fields: [
+      { key: 'base_url', label: 'API Base URL', type: 'text', required: true, default: 'https://api.fish.audio/v1', placeholder: 'https://api.fish.audio/v1', tooltip: 'HTTPS is required except for an explicit loopback mock.' },
+      { key: 'model', label: 'Model', type: 'combobox', required: true, default: 's2.1-pro', suggestions: ['s2.1-pro', 's2.1-pro-free', 's2-pro', 's1', 'drama-3-preview'] },
+      { key: 'reference_id', label: 'Voice Reference ID', type: 'text', required: true, placeholder: 'Voice model ID from the Fish Audio library' },
+      { key: 'audio_format', label: 'Audio Format', type: 'combobox', required: false, default: 'pcm', suggestions: ['pcm', 'wav'], tooltip: 'PCM streams progressively and is recommended for calls. WAV is buffered before playback.' },
+      { key: 'sample_rate', label: 'Provider Sample Rate (Hz)', type: 'combobox', required: false, placeholder: 'Leave blank to follow the call', suggestions: ['8000', '16000', '24000', '32000', '44100'] },
+      { key: 'latency', label: 'Latency Mode', type: 'combobox', required: false, default: 'low', suggestions: ['low', 'balanced', 'normal'] },
+      { key: 'chunk_length', label: 'Synthesis Chunk Length', type: 'number', required: false, default: 200, tooltip: 'Fish Audio accepts values from 100 to 300.' },
+      { key: 'temperature', label: 'Temperature', type: 'number', required: false, default: 0.7 },
+      { key: 'top_p', label: 'Top P', type: 'number', required: false, default: 0.7 },
+      { key: 'connect_timeout_sec', label: 'Connect Timeout (sec)', type: 'number', required: false, default: 10 },
+      { key: 'read_timeout_sec', label: 'Inter-chunk Timeout (sec)', type: 'number', required: false, default: 30, tooltip: 'Fails a stalled stream while allowing long synthesis to continue when chunks keep arriving.' },
+      OUTPUT_RESAMPLER_FIELD,
+    ],
+  },
+  {
     id: 'openai',
     label: 'OpenAI TTS',
     description: 'OpenAI text-to-speech API',

@@ -314,6 +314,123 @@ async def test_modular_provider_credentials_verify_failure(monkeypatch, provider
 
 
 @pytest.mark.asyncio
+async def test_fish_audio_credentials_verify_uses_official_model_endpoint(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        config_api,
+        "_read_merged_config_dict",
+        lambda: {
+            "providers": {
+                "fishaudio_tts": {
+                    "type": "fishaudio",
+                    "api_key": "test-secret",
+                    "base_url": "https://api.fish.audio/v1",
+                }
+            }
+        },
+    )
+
+    response = await config_api.verify_provider_credentials("fishaudio_tts")
+
+    assert response["status"] == "success"
+    assert calls[0][0] == "https://api.fish.audio/model"
+    assert calls[0][1]["params"] == {"page_size": 1}
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_credentials_verify_rejects_nonofficial_remote_host(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        config_api,
+        "_read_merged_config_dict",
+        lambda: {
+            "providers": {
+                "fishaudio_tts": {
+                    "type": "fishaudio",
+                    "api_key": "test-secret",
+                    "base_url": "https://untrusted.example/v1",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await config_api.verify_provider_credentials("fishaudio_tts")
+
+    assert exc_info.value.status_code == 400
+    assert "api.fish.audio" in str(exc_info.value.detail)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_provider_connection_test_verifies_configured_key(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    response = await config_api.test_provider_connection(
+        config_api.ProviderTestRequest(
+            name="fishaudio_tts",
+            config={
+                "type": "fishaudio",
+                "capabilities": ["tts"],
+                "api_key": "test-secret",
+                "base_url": "https://api.fish.audio/v1",
+            },
+        )
+    )
+
+    assert response == {"success": True, "message": "Fish Audio API key verified"}
+    assert calls[0][0] == "https://api.fish.audio/model"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_type", ["telnyx", "telenyx", "minimax"])
 async def test_key_required_provider_rejects_no_auth_sentinel(monkeypatch, provider_type):
     provider_key = f"{provider_type}_llm"
