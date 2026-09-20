@@ -6,10 +6,14 @@
  * AI engine expects in `config/ai-agent.yaml`.
  */
 
+import fishAudioModels from './fishAudioModels.json';
+
+export const FISH_AUDIO_MODELS = fishAudioModels as string[];
+
 export interface SubtypeField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'combobox' | 'password';
+  type: 'text' | 'number' | 'combobox' | 'select' | 'password';
   required?: boolean;
   placeholder?: string;
   default?: string | number;
@@ -196,7 +200,7 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
     yamlType: 'fishaudio',
     fields: [
       { key: 'base_url', label: 'API Base URL', type: 'text', required: true, default: 'https://api.fish.audio/v1', placeholder: 'https://api.fish.audio/v1', tooltip: 'HTTPS is required except for an explicit loopback mock.' },
-      { key: 'model', label: 'Model', type: 'combobox', required: true, default: 's2.1-pro', suggestions: ['s2.1-pro', 's2.1-pro-free', 's2-pro', 's1', 'drama-3-preview'] },
+      { key: 'model', label: 'Model', type: 'select', required: true, default: 's2.1-pro', suggestions: FISH_AUDIO_MODELS },
       { key: 'reference_id', label: 'Voice Reference ID', type: 'text', required: true, placeholder: 'Voice model ID from the Fish Audio library' },
       { key: 'audio_format', label: 'Audio Format', type: 'combobox', required: false, default: 'pcm', suggestions: ['pcm', 'wav'], tooltip: 'PCM streams progressively and is recommended for calls. WAV is buffered before playback.' },
       { key: 'sample_rate', label: 'Provider Sample Rate (Hz)', type: 'combobox', required: false, placeholder: 'Leave blank to follow the call', suggestions: ['8000', '16000', '24000', '32000', '44100'] },

@@ -45,6 +45,12 @@ a short synthesis with the configured model and reference voice, so invalid
 keys, unavailable models, missing developer credit, and empty audio responses
 are detected before a call.
 
+The model field is a closed dropdown populated from AAVA's checked-in Fish Audio
+model catalog. CI keeps that catalog synchronized with the runtime default,
+sample configuration, and provider documentation. An older custom model remains
+visible while editing an existing provider, but must be replaced with a listed
+model before it can be selected again.
+
 The adapter is not registered when the key or `reference_id` is missing. A
 pipeline referencing it is rejected at startup; AVA does not silently switch to
 another provider or voice.
