@@ -475,7 +475,7 @@ async def test_fish_audio_credentials_verify_rejects_other_loopback_port(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_fish_audio_provider_connection_test_verifies_configured_key(monkeypatch):
+async def test_fish_audio_provider_connection_test_verifies_real_synthesis(monkeypatch):
     calls = []
 
     class FakeClient:
@@ -488,9 +488,9 @@ async def test_fish_audio_provider_connection_test_verifies_configured_key(monke
         async def __aexit__(self, *_args):
             return None
 
-        async def get(self, url, **kwargs):
+        async def post(self, url, **kwargs):
             calls.append((url, kwargs))
-            return type("Response", (), {"status_code": 200})()
+            return type("Response", (), {"status_code": 200, "content": b"pcm-audio"})()
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
 
@@ -502,12 +502,123 @@ async def test_fish_audio_provider_connection_test_verifies_configured_key(monke
                 "capabilities": ["tts"],
                 "api_key": "test-secret",
                 "base_url": "https://api.fish.audio/v1",
+                "model": "s2.1-pro-free",
+                "reference_id": "voice-123",
             },
         )
     )
 
-    assert response == {"success": True, "message": "Fish Audio API key verified"}
-    assert calls[0][0] == "https://api.fish.audio/model"
+    assert response == {"success": True, "message": "Fish Audio synthesis verified"}
+    assert calls[0][0] == "https://api.fish.audio/v1/tts"
+    assert calls[0][1]["headers"]["model"] == "s2.1-pro-free"
+    assert calls[0][1]["json"]["reference_id"] == "voice-123"
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_provider_connection_test_reports_payment_required(monkeypatch):
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, **_kwargs):
+            return type("Response", (), {"status_code": 402, "content": b""})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    response = await config_api.test_provider_connection(
+        config_api.ProviderTestRequest(
+            name="fishaudio_tts",
+            config={
+                "type": "fishaudio",
+                "api_key": "test-secret",
+                "base_url": "https://api.fish.audio/v1",
+                "model": "s2.1-pro",
+                "reference_id": "voice-123",
+            },
+        )
+    )
+
+    assert response["success"] is False
+    assert "402" in response["message"]
+    assert "account credit" in response["message"]
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_provider_connection_test_uses_fixed_mock_endpoint(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200, "content": b"pcm"})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    response = await config_api.test_provider_connection(
+        config_api.ProviderTestRequest(
+            name="fishaudio_tts",
+            config={
+                "type": "fishaudio",
+                "api_key": "mock-key",
+                "base_url": "http://localhost:8788/v1",
+                "reference_id": "voice-123",
+            },
+        )
+    )
+
+    assert response["success"] is True
+    assert calls[0][0] == "http://127.0.0.1:8788/v1/tts"
+
+
+@pytest.mark.asyncio
+async def test_fish_audio_provider_connection_test_rejects_untrusted_host(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"status_code": 200, "content": b"pcm"})()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    response = await config_api.test_provider_connection(
+        config_api.ProviderTestRequest(
+            name="fishaudio_tts",
+            config={
+                "type": "fishaudio",
+                "api_key": "test-secret",
+                "base_url": "https://untrusted.example/v1",
+                "reference_id": "voice-123",
+            },
+        )
+    )
+
+    assert response["success"] is False
+    assert calls == []
 
 
 @pytest.mark.asyncio

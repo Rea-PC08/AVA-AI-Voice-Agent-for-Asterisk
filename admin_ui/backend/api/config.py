@@ -37,7 +37,10 @@ except ModuleNotFoundError:
     # Source checkout/tests: import the same canonical module from root src/.
     from src.config_apply import classify_config_change
 
-from src.fish_audio_url import fish_audio_verification_url
+from src.fish_audio_url import (
+    fish_audio_synthesis_test_url,
+    fish_audio_verification_url,
+)
 from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
 
 # A11: Maximum number of backups to keep
@@ -1971,9 +1974,10 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
         
         # ============================================================
-        # FISH AUDIO TTS - validate the key via the official voice-model API.
-        # A loopback-only exception supports the bundled mock; verification
-        # never forwards a bearer key to an arbitrary configured HTTPS host.
+        # FISH AUDIO TTS - perform a minimal real synthesis. A key-only model
+        # listing can succeed even when the configured model returns 402 for
+        # missing credit or entitlement. A loopback-only exception supports
+        # the bundled mock; bearer credentials never reach arbitrary hosts.
         # ============================================================
         if provider_type == 'fishaudio':
             api_key = (
@@ -1984,23 +1988,48 @@ async def test_provider_connection(request: ProviderTestRequest):
             )
             if not api_key:
                 return {"success": False, "message": "Fish Audio API key is not configured"}
+            reference_id = str(provider_config.get('reference_id') or '').strip()
+            if not reference_id:
+                return {"success": False, "message": "Fish Audio reference ID is not configured"}
+            model = str(provider_config.get('model') or 's2.1-pro').strip()
             try:
-                model_url = fish_audio_verification_url(
+                tts_url = fish_audio_synthesis_test_url(
                     str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
                 )
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(
-                        model_url,
-                        params={"page_size": 1},
-                        headers={"Authorization": f"Bearer {api_key}"},
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                    response = await client.post(
+                        tts_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "model": model,
+                        },
+                        json={
+                            "text": "Connection test.",
+                            "reference_id": reference_id,
+                            "format": "pcm",
+                            "sample_rate": 8000,
+                            "latency": "low",
+                            "chunk_length": 200,
+                            "normalize": True,
+                            "temperature": 0.7,
+                            "top_p": 0.7,
+                        },
                     )
+                if response.status_code == 200 and response.content:
+                    return {"success": True, "message": "Fish Audio synthesis verified"}
                 if response.status_code == 200:
-                    return {"success": True, "message": "Fish Audio API key verified"}
+                    return {"success": False, "message": "Fish Audio returned no audio"}
                 if response.status_code == 401:
                     return {"success": False, "message": "Invalid Fish Audio API key (401)"}
+                if response.status_code == 402:
+                    return {
+                        "success": False,
+                        "message": "Fish Audio rejected synthesis (402): check model access or account credit",
+                    }
                 return {
                     "success": False,
-                    "message": f"Fish Audio API error: HTTP {response.status_code}",
+                    "message": f"Fish Audio synthesis failed: HTTP {response.status_code}",
                 }
             except Exception:
                 logger.debug("Fish Audio provider validation failed", exc_info=True)

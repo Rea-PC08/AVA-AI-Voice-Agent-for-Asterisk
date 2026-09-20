@@ -40,8 +40,10 @@ FISH_AUDIO_REFERENCE_ID=voice-model-id # legacy env-only configuration
 
 You can also add or edit a Fish Audio TTS provider under **Providers** in the
 Admin UI, save it, then upload a provider-scoped API key. Managed keys are stored
-in owner-only files and are not written into YAML. **Test Connection** verifies
-the key against Fish Audio's voice-model endpoint.
+in owner-only files and are not written into YAML. **Test Connection** performs
+a short synthesis with the configured model and reference voice, so invalid
+keys, unavailable models, missing developer credit, and empty audio responses
+are detected before a call.
 
 The adapter is not registered when the key or `reference_id` is missing. A
 pipeline referencing it is rejected at startup; AVA does not silently switch to
@@ -162,7 +164,7 @@ developer balance gets `402 Payment Required` from the paid models.
 | `Fish Audio TTS requires an API key` | `FISH_AUDIO_API_KEY` is unset, or the provider block has an empty `api_key`. |
 | Pipeline resolves to a placeholder adapter | Same cause, or `enabled: false`. The startup log says `Fish Audio TTS pipeline adapter not registered`. |
 | HTTP 401 in the engine log | Key rejected by the service; check it has TTS access and remaining credit. |
-| HTTP 402 / quota errors | Out of credit on the Fish Audio account. |
+| HTTP 402 / quota errors | The selected model needs developer credit or an entitlement the account does not have. Add credit or select a model available to the account. |
 | HTTP 422 `unsupported sample_rate` | Something forced a rate the service does not emit. Leave `sample_rate: null`. |
 | `Unsupported Fish Audio TTS output format` | `audio_format` must be `pcm` or `wav`; mp3 and opus are not used for calls. |
 | Audio plays but sounds thin or metallic | Check the transport encoding and rate in `options.tts.format`; on 8 kHz telephony the adapter should report `source_sample_rate=8000` (no resample). |

@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 FISH_AUDIO_OFFICIAL_VERIFICATION_URL = "https://api.fish.audio/model"
 FISH_AUDIO_MOCK_VERIFICATION_URL = "http://127.0.0.1:8788/model"
+FISH_AUDIO_OFFICIAL_TTS_URL = "https://api.fish.audio/v1/tts"
+FISH_AUDIO_MOCK_TTS_URL = "http://127.0.0.1:8788/v1/tts"
 
 
 def validate_fish_audio_base_url(base_url: str) -> str:
@@ -68,5 +70,34 @@ def fish_audio_verification_url(base_url: str) -> str:
         return FISH_AUDIO_MOCK_VERIFICATION_URL
     raise RuntimeError(
         "Credential verification supports only api.fish.audio or the bundled "
+        "loopback mock on port 8788"
+    )
+
+
+def fish_audio_synthesis_test_url(base_url: str) -> str:
+    """Return a fixed allowlisted endpoint for provider connection testing.
+
+    A provider connection test sends the bearer credential in a real synthesis
+    request so it can detect model entitlement and billing failures. Keep the
+    destination fixed rather than interpolating a user-controlled path.
+    """
+    normalized = validate_fish_audio_base_url(base_url)
+    parsed = urlparse(normalized)
+    hostname = (parsed.hostname or "").lower()
+
+    if (
+        parsed.scheme == "https"
+        and hostname == "api.fish.audio"
+        and parsed.port in {None, 443}
+    ):
+        return FISH_AUDIO_OFFICIAL_TTS_URL
+    if (
+        parsed.scheme == "http"
+        and hostname in {"localhost", "127.0.0.1", "::1"}
+        and parsed.port == 8788
+    ):
+        return FISH_AUDIO_MOCK_TTS_URL
+    raise RuntimeError(
+        "Synthesis testing supports only api.fish.audio or the bundled "
         "loopback mock on port 8788"
     )
