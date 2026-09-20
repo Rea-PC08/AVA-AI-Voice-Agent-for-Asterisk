@@ -54,6 +54,9 @@ interface VertexRegion {
 
 interface CredentialsStatus {
     uploaded: boolean;
+    configured?: boolean;
+    source?: string | null;
+    path?: string;
     filename: string | null;
     project_id: string | null;
     client_email: string | null;
@@ -146,6 +149,13 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
     }, [config.use_vertex_ai]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const selectedModel = normalizeGoogleLiveModelForUi(config.llm_model);
+    const vertexUploadLabel = uploading
+        ? 'Uploading...'
+        : credentials?.uploaded && !credentials?.configured
+          ? 'Repair Per-Instance Credential'
+          : credentials?.configured
+            ? 'Upload Per-Instance Override'
+            : 'Upload Service Account JSON';
 
     // File upload handler
     const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -164,10 +174,18 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 headers: { 'Content-Type': 'multipart/form-data' },
             });
             await fetchVertexData();
-            // Auto-fill project ID if empty
-            if (res.data.project_id && !config.vertex_project) {
-                handleChange('vertex_project', res.data.project_id);
-            }
+            // Keep the parent's in-memory form synchronized with the backend
+            // write. Otherwise a later Save can erase credentials_path and
+            // strand the per-instance file that was just uploaded.
+            applyCredentialPatch(
+                {
+                    credentials_path: res.data.path,
+                    ...(res.data.project_id && !config.vertex_project
+                        ? { vertex_project: res.data.project_id }
+                        : {}),
+                },
+                onChange,
+            );
         } catch (e: any) {
             setUploadError(e.response?.data?.detail || 'Upload failed');
         } finally {
@@ -189,6 +207,9 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         try {
             await axios.delete(providerKey ? `${providerCredentialsBase}/vertex-json` : `${providerCredentialsBase}/credentials`);
             setCredentials({ uploaded: false, filename: null, project_id: null, client_email: null, uploaded_at: null });
+            if (providerKey) {
+                applyCredentialPatch({ credentials_path: undefined }, onChange);
+            }
             setVerifyResult(null);
             toast.success('Service account credentials deleted');
         } catch (e: any) {
@@ -283,7 +304,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                             linkText="Service accounts"
                                         />
                                     </div>
-                                    {credentials?.uploaded && (
+                                    {credentials?.uploaded && credentials?.configured && (
                                         <button
                                             type="button"
                                             onClick={handleVerifyCredentials}
@@ -296,7 +317,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                     )}
                                 </div>
 
-                                {credentials?.uploaded ? (
+                                {credentials?.uploaded && credentials?.configured ? (
                                     <div className="flex items-center gap-3 p-2 rounded border border-green-200 dark:border-green-800 bg-green-50/40 dark:bg-green-900/10">
                                         <FileJson className="w-8 h-8 text-green-600" />
                                         <div className="flex-1 min-w-0">
@@ -316,22 +337,42 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         </button>
                                     </div>
                                 ) : (
-                                    <div className="flex items-center gap-2">
-                                        <input
-                                            ref={fileInputRef}
-                                            type="file"
-                                            accept=".json"
-                                            onChange={handleFileUpload}
-                                            className="hidden"
-                                            id="vertex-json-upload"
-                                        />
-                                        <label
-                                            htmlFor="vertex-json-upload"
-                                            className={`flex items-center gap-2 px-3 py-2 rounded border border-dashed border-input cursor-pointer hover:bg-muted/50 ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
-                                        >
-                                            {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                                            <span className="text-sm">{uploading ? 'Uploading...' : 'Upload Service Account JSON'}</span>
-                                        </label>
+                                    <div className="space-y-2">
+                                        {credentials?.configured && (
+                                            <div className="flex items-start gap-2 p-2 rounded border border-blue-200 dark:border-blue-800 bg-blue-50/40 dark:bg-blue-900/10 text-xs text-blue-800 dark:text-blue-300">
+                                                <CheckCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                                                <span>
+                                                    Using {credentials.source === 'legacy_shared_file' ? 'the legacy shared' : 'an externally configured'} service-account file
+                                                    {credentials.path && <> at <code>{credentials.path}</code></>}.
+                                                    Uploading here creates a per-instance override; the existing file is not copied or deleted.
+                                                </span>
+                                            </div>
+                                        )}
+                                        {credentials?.uploaded && !credentials?.configured && (
+                                            <div className="flex items-start gap-2 p-2 rounded border border-yellow-200 dark:border-yellow-800 bg-yellow-50/40 dark:bg-yellow-900/10 text-xs text-yellow-800 dark:text-yellow-300">
+                                                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                                                <span>
+                                                    A per-instance service-account file exists but this provider does not reference it. Upload the credential again to repair the provider path.
+                                                </span>
+                                            </div>
+                                        )}
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                ref={fileInputRef}
+                                                type="file"
+                                                accept=".json"
+                                                onChange={handleFileUpload}
+                                                className="hidden"
+                                                id="vertex-json-upload"
+                                            />
+                                            <label
+                                                htmlFor="vertex-json-upload"
+                                                className={`flex items-center gap-2 px-3 py-2 rounded border border-dashed border-input cursor-pointer hover:bg-muted/50 ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
+                                            >
+                                                {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                                                <span className="text-sm">{vertexUploadLabel}</span>
+                                            </label>
+                                        </div>
                                     </div>
                                 )}
 
@@ -613,8 +654,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             type="number"
                             step="0.1"
                             className="w-full p-2 rounded border border-input bg-background"
-                            value={config.llm_temperature || 0.7}
-                            onChange={(e) => handleChange('llm_temperature', parseFloat(e.target.value))}
+                            value={config.llm_temperature ?? 0.7}
+                            onChange={(e) => handleChange('llm_temperature', e.target.value ? parseFloat(e.target.value) : 0.7)}
                         />
                         <p className="text-xs text-muted-foreground">
                             Controls randomness (0.0-2.0). Lower = more focused, higher = more creative.
@@ -640,7 +681,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             type="number"
                             className="w-full p-2 rounded border border-input bg-background"
                             value={config.llm_max_output_tokens || 8192}
-                            onChange={(e) => handleChange('llm_max_output_tokens', parseInt(e.target.value))}
+                            onChange={(e) => handleChange('llm_max_output_tokens', e.target.value ? parseInt(e.target.value) : 8192)}
                         />
                         <p className="text-xs text-muted-foreground">
                             Maximum tokens in response. Higher allows longer answers but increases latency.
@@ -670,8 +711,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 step="0.01"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.llm_top_p || 0.95}
-                                onChange={(e) => handleChange('llm_top_p', parseFloat(e.target.value))}
+                                value={config.llm_top_p ?? 0.95}
+                                onChange={(e) => handleChange('llm_top_p', e.target.value ? parseFloat(e.target.value) : 0.95)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Nucleus sampling (0.0-1.0). Considers tokens comprising top P probability mass.
@@ -697,7 +738,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.llm_top_k || 40}
-                                onChange={(e) => handleChange('llm_top_k', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('llm_top_k', e.target.value ? parseInt(e.target.value) : 40)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Limits to top K most likely tokens. Lower = more focused responses.
@@ -757,7 +798,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.input_sample_rate_hz || 8000}
-                                onChange={(e) => handleChange('input_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('input_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 8000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate from Asterisk. Standard telephony uses 8000 Hz.
@@ -811,7 +852,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.output_sample_rate_hz || 24000}
-                                onChange={(e) => handleChange('output_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('output_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 24000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate from Google. 24000 Hz is native for Gemini audio.
@@ -864,7 +905,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.target_sample_rate_hz || 8000}
-                                onChange={(e) => handleChange('target_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('target_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 8000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Final sample rate for playback. 8000 Hz for standard telephony.
@@ -924,7 +965,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.provider_input_sample_rate_hz || 16000}
-                                onChange={(e) => handleChange('provider_input_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('provider_input_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 16000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate for Google API input. 16000 Hz is optimal for Gemini STT.
@@ -1077,8 +1118,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.input_gain_target_rms || 0}
-                                onChange={(e) => handleChange('input_gain_target_rms', parseInt(e.target.value))}
+                                value={config.input_gain_target_rms ?? 0}
+                                onChange={(e) => handleChange('input_gain_target_rms', e.target.value ? parseInt(e.target.value) : 0)}
                             />
                             <p className="text-xs text-muted-foreground">Optional normalization target for inbound audio.</p>
                         </div>
@@ -1101,8 +1142,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.input_gain_max_db || 0}
-                                onChange={(e) => handleChange('input_gain_max_db', parseInt(e.target.value))}
+                                value={config.input_gain_max_db ?? 0}
+                                onChange={(e) => handleChange('input_gain_max_db', e.target.value ? parseFloat(e.target.value) : 0)}
                             />
                             <p className="text-xs text-muted-foreground">Optional max gain applied during normalization.</p>
                         </div>
