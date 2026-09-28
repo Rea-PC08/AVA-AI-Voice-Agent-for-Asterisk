@@ -1605,6 +1605,15 @@ class Engine:
         session = await self.session_store.get_by_call_id(call_id)
         if not session or bool(getattr(session, "cleanup_in_progress", False)):
             return
+        # Google Live keeps a persistent playback stream across response segments.
+        # End the first-greeting state at the first drained segment, otherwise the
+        # long greeting barge-in guard is incorrectly applied to every later turn.
+        if drained and getattr(session, "conversation_state", None) == "greeting":
+            provider_name = getattr(session, "provider_name", None)
+            if self._get_provider_kind(provider_name) == "google_live":
+                coordinator = getattr(self, "conversation_coordinator", None)
+                if coordinator is not None:
+                    await coordinator.update_conversation_state(call_id, "listening")
         if clear_tts_gating_after_drain:
             await self._clear_tts_gating_after_provider_drain(
                 call_id,
@@ -4059,7 +4068,14 @@ class Engine:
     def _get_provider_kind(self, provider_name: Optional[str]) -> Optional[str]:
         if not provider_name:
             return None
-        return self.provider_kinds.get(provider_name) or provider_name
+        return getattr(self, "provider_kinds", {}).get(provider_name) or provider_name
+
+    def _google_live_full_duplex_barge_in(self, provider_name: str, provider: Any) -> bool:
+        """Keep the new interruption mode scoped to the configured 3.8 instance."""
+        if self._get_provider_kind(provider_name) != "google_live":
+            return False
+        check = getattr(provider, "uses_full_duplex_barge_in", None)
+        return bool(callable(check) and check())
 
     def _provider_fallback_is_allowed(self, provider_name: str, allow: set[str]) -> bool:
         """Match fallback policy by configured instance name or provider kind."""
@@ -7841,6 +7857,11 @@ class Engine:
     async def _attended_transfer_timeout_guard(self, call_id: str, agent_channel_id: str, *, timeout_sec: float) -> None:
         try:
             await asyncio.sleep(max(0.0, float(timeout_sec)) + 2.0)
+            # Asterisk normally destroys an unanswered leg at dial_timeout.
+            # Its channel-end handler may already own the resume path; do not
+            # race that recovery with a second timeout-driven mutation.
+            if self._attended_transfer_agent_channel_to_call_id.get(agent_channel_id) != call_id:
+                return
             session = await self.session_store.get_by_call_id(call_id)
             if not session:
                 # Session may have already been cleaned up; avoid leaking mappings.
@@ -9197,7 +9218,12 @@ class Engine:
         except Exception:
             logger.debug("Failed to play attended transfer decline prompt", call_id=call_id, reason=reason, exc_info=True)
         try:
-            session = await self.session_store.get_by_call_id(call_id) or session
+            # The caller may have hung up while the failure prompt was being
+            # synthesized or played. Never reinsert a removed call session.
+            current_session = await self.session_store.get_by_call_id(call_id)
+            if not current_session or bool(getattr(current_session, "cleanup_in_progress", False)):
+                return
+            session = current_session
             if session.current_action and session.current_action.get("type") == "attended_transfer":
                 session.current_action = None
             # Re-enable capture so the AI can resume.
@@ -9973,10 +9999,37 @@ class Engine:
                 session = await self.session_store.get_by_channel_id(channel_or_call_id)
             if not session:
                 # Attended transfer agent leg is a separate SIP channel that is not tracked in SessionStore.
-                # We keep an in-memory mapping so that if either side hangs up, we can clean up the other leg.
+                # The agent leg's pre-answer failure must resume the caller;
+                # only an answered agent leg may own whole-call cleanup.
                 mapped_call_id = self._attended_transfer_agent_channel_to_call_id.get(channel_or_call_id)
                 if mapped_call_id:
-                    session = await self.session_store.get_by_call_id(mapped_call_id)
+                    mapped_session = await self.session_store.get_by_call_id(mapped_call_id)
+                    if not mapped_session or bool(getattr(mapped_session, "cleanup_in_progress", False)):
+                        self._unregister_attended_transfer_agent_channel(channel_or_call_id)
+                        return
+                    action = getattr(mapped_session, "current_action", None) or {}
+                    action_agent_id = str(action.get("agent_channel_id") or "")
+                    if action.get("type") != "attended_transfer" or action_agent_id not in ("", str(channel_or_call_id)):
+                        # Stale/superseded leg ownership is not a caller
+                        # hangup. Retire its mapping without touching the
+                        # current call action.
+                        self._unregister_attended_transfer_agent_channel(channel_or_call_id)
+                        return
+                    if not bool(action.get("answered", False)):
+                        # Unregister before the first await so a paired
+                        # StasisEnd/ChannelDestroyed cannot tear down the
+                        # caller while recovery is in progress.
+                        self._unregister_attended_transfer_agent_channel(channel_or_call_id)
+                        logger.info(
+                            "Unanswered attended transfer leg ended; resuming caller",
+                            call_id=mapped_call_id,
+                            agent_channel_id=channel_or_call_id,
+                        )
+                        await self._attended_transfer_abort_and_resume(
+                            mapped_session, channel_or_call_id, reason="no-answer"
+                        )
+                        return
+                    session = mapped_session
             if not session:
                 predial_channel_map = getattr(self, "_predial_transfer_channel_to_call_id", {})
                 mapped_call_id = predial_channel_map.get(channel_or_call_id)
@@ -11282,10 +11335,11 @@ class Engine:
                     return
                 if not getattr(session, "provider_session_active", False):
                     return
-                # Google Live needs silence substitution during ordinary output.
-                # Other native full-agent providers keep caller audio flowing so
-                # their provider-owned VAD/barge-in remains functional.
-                needs_gating = self._get_provider_kind(provider_name) == "google_live"
+                # Legacy Google Live sessions retain silence substitution; 3.8
+                # opts into server-owned VAD by receiving real caller audio.
+                # Other native full-agent providers remain unchanged.
+                full_duplex_barge_in = self._google_live_full_duplex_barge_in(provider_name, provider)
+                needs_gating = self._get_provider_kind(provider_name) == "google_live" and not full_duplex_barge_in
                 
                 if needs_gating and not session.audio_capture_enabled:
                     # Send silence instead of blocking so Google Live's continuous
@@ -11464,18 +11518,19 @@ class Engine:
                         exc_info=True,
                     )
                 # Provider-owned mode: local VAD fallback may flush local output (never cancels provider).
-                try:
-                    await self._maybe_provider_barge_in_fallback(
-                        session,
-                        pcm16=pcm_bytes,
-                        pcm_rate_hz=pcm_rate,
-                        audiosocket_wire=audio_bytes,
-                        source="audiosocket",
-                        wire_encoding=frame_format,
-                        wire_sample_rate=frame_rate,
-                    )
-                except Exception:
-                    logger.debug("Provider barge-in fallback check failed (AudioSocket)", call_id=caller_channel_id, exc_info=True)
+                if not full_duplex_barge_in:
+                    try:
+                        await self._maybe_provider_barge_in_fallback(
+                            session,
+                            pcm16=pcm_bytes,
+                            pcm_rate_hz=pcm_rate,
+                            audiosocket_wire=audio_bytes,
+                            source="audiosocket",
+                            wire_encoding=frame_format,
+                            wire_sample_rate=frame_rate,
+                        )
+                    except Exception:
+                        logger.debug("Provider barge-in fallback check failed (AudioSocket)", call_id=caller_channel_id, exc_info=True)
                 return
             else:
                 logger.debug(
@@ -12935,11 +12990,14 @@ class Engine:
         capabilities: Any,
         *,
         audio_capture_enabled: bool,
+        provider: Any = None,
     ) -> str:
         """Choose whether gated ExternalMedia caller audio is forwarded, silenced, or dropped."""
         if audio_capture_enabled:
             return "forward"
         if self._get_provider_kind(provider_name) == "google_live":
+            if self._google_live_full_duplex_barge_in(provider_name, provider):
+                return "forward"
             return "silence"
         if bool(
             capabilities
@@ -13221,6 +13279,7 @@ class Engine:
                     provider_name,
                     capabilities,
                     audio_capture_enabled=bool(session.audio_capture_enabled),
+                    provider=provider,
                 )
 
                 if gating_mode == "silence":
@@ -13292,16 +13351,17 @@ class Engine:
                     logger.debug("Continuous-input transport forward error", call_id=caller_channel_id, source=source, error=str(exc))
 
                 # Provider-owned mode: local VAD fallback may flush local output (never cancels provider).
-                try:
-                    await self._maybe_provider_barge_in_fallback(
-                        session,
-                        pcm16=pcm_for_barge_in,
-                        pcm_rate_hz=pcm_sample_rate,
-                        audiosocket_wire=None,
-                        source=source,
-                    )
-                except Exception:
-                    logger.debug("Provider barge-in fallback check failed (continuous)", call_id=caller_channel_id, source=source, exc_info=True)
+                if not self._google_live_full_duplex_barge_in(provider_name, provider):
+                    try:
+                        await self._maybe_provider_barge_in_fallback(
+                            session,
+                            pcm16=pcm_for_barge_in,
+                            pcm_rate_hz=pcm_sample_rate,
+                            audiosocket_wire=None,
+                            source=source,
+                        )
+                    except Exception:
+                        logger.debug("Provider barge-in fallback check failed (continuous)", call_id=caller_channel_id, source=source, exc_info=True)
                 return
 
             # Below: standard gating/barge-in logic for hybrid (P2) providers only

@@ -58,10 +58,20 @@ from src.tools.adapters.sanitize import sanitize_tool_result_for_json_string
 
 # Tool calling support
 from src.tools.registry import tool_registry
+from src.tools.base import ToolExecutionBehavior, ToolResponseScheduling
 from src.tools.adapters.google import GoogleToolAdapter
 from src.tools.execution_history import record_in_call_tool_result
 
 logger = get_logger(__name__)
+
+
+def build_vertex_live_websocket_url(location: str) -> str:
+    """Select Google's regional or jurisdictional multi-region Live host."""
+    if location in ("us", "eu"):
+        host = f"aiplatform.{location}.rep.googleapis.com"
+    else:
+        host = f"{location}-aiplatform.googleapis.com"
+    return f"wss://{host}/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
 
 
 def _merge_transcription_fragment(buffer: str, fragment: str, last_fragment: str) -> Tuple[str, str]:
@@ -160,10 +170,37 @@ class GoogleLiveProvider(AIProviderInterface):
     - Output: 24kHz PCM16 from Gemini → 8kHz µ-law/PCM16 → AudioSocket
     """
     DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+    GEMINI_3_8_LIVE_MODEL = "gemini-3.8-live"
+    GEMINI_3_8_NON_BLOCKING_TOOLS = frozenset({"check_extension_status"})
+    TOOL_DRAIN_GRACE_SEC = 2.0
     LEGACY_LIVE_MODEL_MAP = {
         # Older preview aliases that are no longer preferred.
         "gemini-live-2.5-flash-preview": DEFAULT_LIVE_MODEL,
     }
+
+    def uses_full_duplex_barge_in(self) -> bool:
+        """Only 3.8 opts into provider-owned interruption during playback."""
+        return bool(
+            self._normalize_model_name(self.config.llm_model) == self.GEMINI_3_8_LIVE_MODEL
+            and getattr(self.config, "full_duplex_barge_in_3_8", True)
+        )
+
+    def _tool_policy(self, tool_name: str) -> tuple[ToolExecutionBehavior, ToolResponseScheduling]:
+        """Resolve shared tool metadata, failing closed for unregistered tools."""
+        registered = self._tool_adapter.registry.get(tool_name) if self._tool_adapter else None
+        if registered is not None:
+            definition = registered.definition
+            try:
+                behavior = ToolExecutionBehavior(definition.execution_behavior)
+                scheduling = ToolResponseScheduling(definition.response_scheduling)
+                return behavior, scheduling
+            except (AttributeError, ValueError):
+                return ToolExecutionBehavior.BLOCKING, ToolResponseScheduling.WHEN_IDLE
+        # The built-in status lookup is safe before registry initialization.
+        # Every other unresolved name stays BLOCKING.
+        if tool_name in self.GEMINI_3_8_NON_BLOCKING_TOOLS:
+            return ToolExecutionBehavior.NON_BLOCKING, ToolResponseScheduling.WHEN_IDLE
+        return ToolExecutionBehavior.BLOCKING, ToolResponseScheduling.WHEN_IDLE
 
     def __init__(
         self,
@@ -181,6 +218,13 @@ class GoogleLiveProvider(AIProviderInterface):
         self.websocket: Optional[ClientConnection] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._tool_call_tasks: Dict[str, asyncio.Task] = {}
+        self._seen_tool_call_ids: set[str] = set()
+        self._detached_tool_tasks: set[asyncio.Task] = set()
+        self._active_tool_call_ids: set[str] = set()
+        self._tool_call_names: Dict[str, str] = {}
+        self._tool_call_lock = asyncio.Lock()
+        self._tool_teardown_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._gating_manager = gating_manager
 
@@ -210,6 +254,7 @@ class GoogleLiveProvider(AIProviderInterface):
         self._force_farewell_text: str = ""
         self._force_farewell_sent: bool = False
         self._post_hangup_output_detected: bool = False
+        self._terminal_audio_cutoff_after_tool: bool = False
         
         # Initialize tool adapter early (before start_session) so engine can inject context
         # This ensures _session_store, _ari_client, etc. are available for tool execution
@@ -758,12 +803,14 @@ class GoogleLiveProvider(AIProviderInterface):
         self._call_id = call_id
         self._closing = False
         self._closed = False
+        self._seen_tool_call_ids.clear()
         self._session_start_time = time.time()
         self._setup_complete = False
         self._greeting_completed = False
         self._ws_unavailable_logged = False
         self._ws_send_close_logged = False
         self._hangup_ready_emitted = False
+        self._terminal_audio_cutoff_after_tool = False
         self._input_transcription_buffer = ""
         self._output_transcription_buffer = ""
         self._model_text_buffer = ""
@@ -850,10 +897,7 @@ class GoogleLiveProvider(AIProviderInterface):
                 self._vertex_active = True  # persist for downstream methods
                 ws_extra_headers = {"Authorization": f"Bearer {bearer_token}"}
 
-                vertex_endpoint = (
-                    f"wss://{vertex_location}-aiplatform.googleapis.com"
-                    f"/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
-                )
+                vertex_endpoint = build_vertex_live_websocket_url(vertex_location)
                 ws_url = vertex_endpoint
 
                 logger.info(
@@ -994,6 +1038,11 @@ class GoogleLiveProvider(AIProviderInterface):
         system_prompt = self.config.instructions
         
         response_modalities = self._normalize_response_modalities(self.config.response_modalities)
+        model_name = self._normalize_model_name(self.config.llm_model)
+        is_gemini_3_8 = model_name == self.GEMINI_3_8_LIVE_MODEL
+        if is_gemini_3_8 and response_modalities != ["AUDIO"]:
+            logger.warning("Gemini 3.8 Live supports AUDIO responses only; overriding response modalities", call_id=self._call_id)
+            response_modalities = ["AUDIO"]
 
         # Build generation config from configurable parameters
         # https://gist.github.com/quartzjer/9636066e96b4f904162df706210770e4
@@ -1034,6 +1083,13 @@ class GoogleLiveProvider(AIProviderInterface):
             try:
                 # Use format_tools() with filtered tool list from context
                 tools = self._tool_adapter.format_tools(tool_names)
+                if is_gemini_3_8:
+                    # Shared tool metadata is fail-closed to BLOCKING. Currently
+                    # only read-only extension status explicitly opts in.
+                    for tool in tools:
+                        for declaration in tool.get("functionDeclarations", []):
+                            behavior, _ = self._tool_policy(declaration.get("name") or "")
+                            declaration["behavior"] = behavior.value
                 if tools:
                     tool_count = len(tools[0].get("functionDeclarations", [])) if tools else 0
                     logger.debug(
@@ -1047,7 +1103,6 @@ class GoogleLiveProvider(AIProviderInterface):
 
         # Setup message
         # Strip any accidental "models/" prefix from config to avoid models/models/...
-        model_name = self._normalize_model_name(self.config.llm_model)
         if model_name.startswith("models/"):
             model_name = model_name[7:]  # Remove "models/" prefix
 
@@ -1489,6 +1544,8 @@ class GoogleLiveProvider(AIProviderInterface):
                 error=str(e),
                 exc_info=True,
             )
+        finally:
+            await self._drain_tool_calls(reason="websocket_closed")
 
     async def _handle_server_message(self, data: Dict[str, Any]) -> None:
         """Handle incoming message from Gemini Live API."""
@@ -1522,7 +1579,10 @@ class GoogleLiveProvider(AIProviderInterface):
         elif message_type == "serverContent":
             await self._handle_server_content(data)
         elif message_type == "toolCall":
-            await self._handle_tool_call(data)
+            if self._normalize_model_name(self.config.llm_model) == self.GEMINI_3_8_LIVE_MODEL:
+                self._schedule_3_8_tool_calls(data)
+            else:
+                await self._handle_tool_call(data)
         elif message_type == "toolCallCancellation":
             await self._handle_tool_call_cancellation(data)
         elif message_type == "goAway":
@@ -1646,7 +1706,7 @@ class GoogleLiveProvider(AIProviderInterface):
         # Handle output transcription (AI speech) - per official API docs
         # Like inputTranscription, API sends incremental fragments that must be concatenated
         output_transcription = content.get("outputTranscription")
-        if output_transcription:
+        if output_transcription and not self._terminal_audio_cutoff_after_tool:
             text = output_transcription.get("text", "")
             if text:
                 self._turn_has_assistant_output = True
@@ -1728,7 +1788,7 @@ class GoogleLiveProvider(AIProviderInterface):
             
             # Handle text output (for debugging/logging only)
             # Note: We now get cleaner AI transcriptions from outputTranscription field
-            if "text" in part:
+            if "text" in part and not self._terminal_audio_cutoff_after_tool:
                 text = part["text"]
                 logger.debug(
                     "Google Live text response from modelTurn (not saved - using outputTranscription instead)",
@@ -1895,6 +1955,11 @@ class GoogleLiveProvider(AIProviderInterface):
             mime_type: inlineData mimeType (may include `rate=...`)
         """
         try:
+            # A terminal tool call after Gemini 3.8's spoken farewell can
+            # produce an additional model continuation. Keep already queued
+            # farewell audio, but never enqueue that post-hangup speech.
+            if self._terminal_audio_cutoff_after_tool:
+                return
             self._last_audio_out_monotonic = time.monotonic()
             if self._hangup_fallback_armed:
                 self._hangup_fallback_audio_started = True
@@ -2100,6 +2165,9 @@ class GoogleLiveProvider(AIProviderInterface):
 
     async def _handle_tool_call(self, data: Dict[str, Any]) -> None:
         """Handle toolCall message."""
+        owner_call_id = self._call_id
+        if self._closing or self._closed or not owner_call_id:
+            return
         tool_call = data.get("toolCall", {})
         func_name = None
         func_args: Dict[str, Any] = {}
@@ -2143,7 +2211,7 @@ class GoogleLiveProvider(AIProviderInterface):
                 # Build tool execution context
                 from src.tools.context import ToolExecutionContext
                 tool_context = ToolExecutionContext(
-                    call_id=self._call_id,
+                    call_id=owner_call_id,
                     caller_channel_id=getattr(self, '_caller_channel_id', None),
                     bridge_id=getattr(self, '_bridge_id', None),
                     caller_number=getattr(self, '_caller_number', None),
@@ -2166,6 +2234,13 @@ class GoogleLiveProvider(AIProviderInterface):
                         "message": f"Tool '{func_name}' not allowed for this call",
                     }
                 else:
+                    if self._closing or self._closed or self._call_id != owner_call_id:
+                        return
+                    # Protect only a tool that has entered actual execution.
+                    # A task still checking allowlists is safe to cancel during
+                    # teardown; it must not begin a transfer after shutdown.
+                    if call_id is not None:
+                        self._active_tool_call_ids.add(call_id)
                     result = await self._tool_adapter.execute_tool(
                         func_name,
                         func_args,
@@ -2174,7 +2249,7 @@ class GoogleLiveProvider(AIProviderInterface):
 
                 await record_in_call_tool_result(
                     session_store=getattr(self, "_session_store", None),
-                    call_id=self._call_id,
+                    call_id=owner_call_id,
                     tool_call_id=call_id,
                     tool_name=func_name,
                     canonical_name=tool_registry.canonicalize_tool_name(func_name),
@@ -2183,6 +2258,11 @@ class GoogleLiveProvider(AIProviderInterface):
                     duration_ms=(time.time() - tool_started_at) * 1000,
                 )
                 tool_result_recorded = True
+
+                # An active call-state action may finish after WebSocket teardown.
+                # Keep its result in call history, but never reply into a stale session.
+                if self._closing or self._closed or self._call_id != owner_call_id:
+                    return
 
                 # Check for hangup intent (like OpenAI Realtime pattern)
                 if func_name == "hangup_call" and result:
@@ -2204,10 +2284,35 @@ class GoogleLiveProvider(AIProviderInterface):
                         )
 
                 # Send tool response (camelCase per official API)
-                # Vertex AI doesn't accept "id" field in function responses (AAVA-191)
+                # Older Vertex models reject id (AAVA-191), but 3.8 requires
+                # matching the server's function-call id on both API surfaces.
                 safe_result = self._build_tool_response_payload(func_name, result)
                 use_vertex = getattr(self, '_vertex_active', getattr(self.config, 'use_vertex_ai', False))
-                if use_vertex:
+                is_gemini_3_8 = self._normalize_model_name(self.config.llm_model) == self.GEMINI_3_8_LIVE_MODEL
+                terminal_after_spoken_farewell = bool(
+                    func_name == "hangup_call"
+                    and result.get("will_hangup")
+                    and is_gemini_3_8
+                    and self._in_audio_burst
+                )
+                if is_gemini_3_8:
+                    if not safe_result:
+                        safe_result = {"status": "error", "message": "Tool returned no result; do not retry automatically."}
+                    else:
+                        safe_result.setdefault("status", "success")
+                        safe_result.setdefault("message", "Tool completed.")
+                    safe_result.setdefault("retryable", False)
+                    behavior, scheduling = self._tool_policy(func_name or "")
+                    if behavior == ToolExecutionBehavior.NON_BLOCKING:
+                        safe_result["scheduling"] = scheduling.value
+                if terminal_after_spoken_farewell:
+                    # Mark the caller-facing boundary before awaiting the tool
+                    # response send: Gemini may emit its continuation as soon
+                    # as that send completes.
+                    self._terminal_audio_cutoff_after_tool = True
+                    safe_result.pop("instruction", None)
+                    safe_result["message"] = "Farewell already spoken; do not speak again."
+                if use_vertex and not is_gemini_3_8:
                     func_response = {
                         "name": func_name,
                         "response": safe_result,
@@ -2223,7 +2328,13 @@ class GoogleLiveProvider(AIProviderInterface):
                         "functionResponses": [func_response]
                     }
                 }
-                await self._send_message(tool_response)
+                if not await self._send_message(tool_response) and not terminal_after_spoken_farewell:
+                    logger.warning(
+                        "Google Live tool response not sent after session closed",
+                        call_id=owner_call_id,
+                        function=func_name,
+                    )
+                    return
 
                 logger.info(
                     "Sent Google Live tool response",
@@ -2232,6 +2343,44 @@ class GoogleLiveProvider(AIProviderInterface):
                 )
 
                 if func_name == "hangup_call" and self._force_farewell_text:
+                    if terminal_after_spoken_farewell:
+                        # The model has already spoken the farewell before
+                        # calling this blocking terminal tool. A new prompt
+                        # interrupts it; even the tool response alone can make
+                        # 3.8 speak a redundant "call disconnected" continuation.
+                        # The response was acknowledged above. End this output
+                        # locally and drain only the audio already enqueued.
+                        had_active_audio = self._in_audio_burst
+                        self._in_audio_burst = False
+                        self._hangup_after_response = False
+                        self._hangup_fallback_emitted = True
+                        if self._output_transcription_buffer:
+                            spoken = self._output_transcription_buffer.strip()
+                            self._last_final_assistant_text = spoken
+                            with contextlib.suppress(Exception):
+                                await self._track_conversation_message("assistant", spoken)
+                            self._output_transcription_buffer = ""
+                            self._last_output_transcription_fragment = ""
+                            self._model_text_buffer = ""
+                        logger.info(
+                            "Completing Gemini 3.8 spoken farewell at hangup tool boundary",
+                            call_id=self._call_id,
+                        )
+                        if self.on_event and had_active_audio:
+                            await self.on_event({
+                                "type": "AgentAudioDone",
+                                "call_id": self._call_id,
+                                "streaming_done": True,
+                            })
+                        if self.on_event and not self._hangup_ready_emitted:
+                            await self.on_event({
+                                "type": "HangupReady",
+                                "call_id": self._call_id,
+                                "reason": "farewell_tool_boundary",
+                                "had_audio": True,
+                            })
+                            self._hangup_ready_emitted = True
+                        continue
                     self._post_hangup_output_detected = False
                     # Send farewell prompt immediately after tool response for both API modes.
                     # The delayed approach (3s wait) was unreliable - WebSocket or call can close
@@ -2261,7 +2410,7 @@ class GoogleLiveProvider(AIProviderInterface):
             if func_name and not tool_result_recorded:
                 await record_in_call_tool_result(
                     session_store=getattr(self, "_session_store", None),
-                    call_id=self._call_id,
+                    call_id=owner_call_id,
                     tool_call_id=call_id,
                     tool_name=func_name,
                     canonical_name=tool_registry.canonicalize_tool_name(func_name),
@@ -2280,7 +2429,7 @@ class GoogleLiveProvider(AIProviderInterface):
             if func_name and not tool_result_recorded:
                 await record_in_call_tool_result(
                     session_store=getattr(self, "_session_store", None),
-                    call_id=self._call_id,
+                    call_id=owner_call_id,
                     tool_call_id=call_id,
                     tool_name=func_name,
                     canonical_name=tool_registry.canonicalize_tool_name(func_name),
@@ -2304,6 +2453,61 @@ class GoogleLiveProvider(AIProviderInterface):
             ids=ids,
             cancellation_keys=list(cancellation.keys()) if isinstance(cancellation, dict) else None,
         )
+        for tool_call_id in ids or []:
+            task = self._tool_call_tasks.get(tool_call_id)
+            if task and not task.done():
+                tool_name = self._tool_call_names.get(tool_call_id)
+                behavior, _ = self._tool_policy(tool_name or "")
+                if tool_call_id in self._active_tool_call_ids and behavior == ToolExecutionBehavior.BLOCKING:
+                    # A transfer/disposition may already have changed external
+                    # state. Let its own guarded lifecycle finish; cancelling the
+                    # coroutine here could strand a channel or partial write.
+                    logger.warning("Ignoring cancellation of active call-state tool", call_id=self._call_id, tool_call_id=tool_call_id, function=tool_name)
+                else:
+                    task.cancel()
+
+    def _schedule_3_8_tool_calls(self, data: Dict[str, Any]) -> None:
+        """Keep the receive loop responsive to 3.8 cancellation and audio frames."""
+        if self._closing or self._closed:
+            return
+        for function_call in (data.get("toolCall") or {}).get("functionCalls", []):
+            tool_call_id = function_call.get("id")
+            if not tool_call_id:
+                logger.error("Gemini 3.8 tool call has no id; refusing execution", call_id=self._call_id)
+                continue
+            if tool_call_id in self._seen_tool_call_ids:
+                logger.warning("Duplicate Gemini 3.8 tool call id ignored", call_id=self._call_id, tool_call_id=tool_call_id)
+                continue
+            self._seen_tool_call_ids.add(tool_call_id)
+
+            async def run_tool(call: Dict[str, Any]) -> None:
+                behavior, _ = self._tool_policy(call.get("name") or "")
+                if behavior == ToolExecutionBehavior.NON_BLOCKING:
+                    if self._closing or self._closed:
+                        return
+                    await self._handle_tool_call({"toolCall": {"functionCalls": [call]}})
+                else:
+                    async with self._tool_call_lock:
+                        if self._closing or self._closed:
+                            return
+                        await self._handle_tool_call({"toolCall": {"functionCalls": [call]}})
+
+            task = asyncio.create_task(run_tool(function_call))
+            self._tool_call_tasks[tool_call_id] = task
+            self._tool_call_names[tool_call_id] = function_call.get("name") or ""
+
+            owner_call_id = self._call_id
+
+            def finish_tool(done: asyncio.Task, call_id: str = tool_call_id) -> None:
+                if self._tool_call_tasks.get(call_id) is done:
+                    self._tool_call_tasks.pop(call_id, None)
+                    self._active_tool_call_ids.discard(call_id)
+                    self._tool_call_names.pop(call_id, None)
+                self._detached_tool_tasks.discard(done)
+                if not done.cancelled() and done.exception():
+                    logger.error("Gemini 3.8 tool task failed", call_id=owner_call_id, tool_call_id=call_id, error=str(done.exception()))
+
+            task.add_done_callback(finish_tool)
 
     def _schedule_forced_farewell_if_needed(self) -> None:
         if self._force_farewell_sent:
@@ -2503,6 +2707,41 @@ class GoogleLiveProvider(AIProviderInterface):
             call_id=self._call_id,
         )
 
+    async def _drain_tool_calls(self, *, reason: str) -> None:
+        """Cancel safe/queued work; let active call-state actions finish safely."""
+        async with self._tool_teardown_lock:
+            current = asyncio.current_task()
+            entries = [(call_id, task) for call_id, task in self._tool_call_tasks.items()
+                       if task is not current and not task.done()]
+            if not entries:
+                return
+            protected = []
+            for call_id, task in entries:
+                behavior, _ = self._tool_policy(self._tool_call_names.get(call_id, ""))
+                if call_id in self._active_tool_call_ids and behavior == ToolExecutionBehavior.BLOCKING:
+                    protected.append((call_id, task))
+                else:
+                    task.cancel()
+
+            pending = {task for _, task in entries}
+            _, pending = await asyncio.wait(pending, timeout=self.TOOL_DRAIN_GRACE_SEC)
+            for call_id, task in entries:
+                if self._tool_call_tasks.get(call_id) is task:
+                    self._tool_call_tasks.pop(call_id, None)
+                self._active_tool_call_ids.discard(call_id)
+                self._tool_call_names.pop(call_id, None)
+                if task in pending:
+                    self._detached_tool_tasks.add(task)
+                    task.add_done_callback(self._detached_tool_tasks.discard)
+            if pending:
+                logger.warning(
+                    "Google Live tool tasks outlived teardown grace",
+                    call_id=self._call_id,
+                    reason=reason,
+                    pending=len(pending),
+                    protected=sum(task in pending for _, task in protected),
+                )
+
     async def stop_session(self) -> None:
         """Stop the Google Live session and cleanup resources."""
         if self._closing or self._closed:
@@ -2531,6 +2770,7 @@ class GoogleLiveProvider(AIProviderInterface):
                                  call_id=self._call_id, exc_info=True)
 
             # Cancel background tasks
+            await self._drain_tool_calls(reason="stop_session")
             if self._receive_task and not self._receive_task.done():
                 self._receive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2572,6 +2812,7 @@ class GoogleLiveProvider(AIProviderInterface):
             self._force_farewell_text = ""
             self._force_farewell_sent = False
             self._post_hangup_output_detected = False
+            self._terminal_audio_cutoff_after_tool = False
             self._last_audio_out_monotonic = None
             self._user_end_intent = None
             self._assistant_farewell_intent = None

@@ -9,7 +9,11 @@ import OutputResamplerField from './OutputResamplerField';
 import {
     GOOGLE_LIVE_MODEL_GROUPS,
     GOOGLE_LIVE_SUPPORTED_MODELS,
+    GOOGLE_LIVE_VERTEX_REGIONS,
+    getGoogleLiveVertexRegionSupport,
+    isGoogleLiveModelCompatible,
     normalizeGoogleLiveModelForUi,
+    preferredGoogleLiveVertexRegion,
 } from '../../../utils/googleLiveModels';
 
 const GOOGLE_LIVE_VOICE_OPTIONS = [
@@ -127,6 +131,15 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         }
     }, [expertEnabled]);
 
+    // Match the saved form value to the AUDIO-only setup sent for Gemini 3.8.
+    // This also corrects older configurations opened directly on that model.
+    useEffect(() => {
+        if (normalizeGoogleLiveModelForUi(config.llm_model) === 'gemini-3.8-live'
+            && config.response_modalities !== 'audio') {
+            onChange({ ...config, response_modalities: 'audio' });
+        }
+    }, [config.llm_model, config.response_modalities]); // eslint-disable-line react-hooks/exhaustive-deps
+
     // Auto-switch model when API mode changes so Vertex ↔ Developer models stay in sync.
     // This useEffect is the authoritative guard — it fires whenever use_vertex_ai flips
     // and corrects the model if it belongs to the wrong API group.
@@ -136,19 +149,44 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         // Only fire on actual toggles, not on initial mount
         if (prevVertexRef.current !== undefined && prevVertexRef.current !== useVertex) {
             const currentModel = config.llm_model || '';
-            const isModelVertex = currentModel.startsWith('gemini-live-');
-            const mismatch = useVertex ? !isModelVertex : isModelVertex;
-            if (mismatch) {
-                const newModel = useVertex
-                    ? 'gemini-live-2.5-flash-native-audio'
-                    : 'gemini-2.5-flash-native-audio-latest';
-                onChange({ ...config, llm_model: newModel });
+            const mismatch = !isGoogleLiveModelCompatible(currentModel, useVertex);
+            const newModel = mismatch
+                ? (useVertex ? 'gemini-live-2.5-flash-native-audio' : 'gemini-2.5-flash-native-audio-latest')
+                : currentModel;
+            const newRegion = useVertex
+                ? preferredGoogleLiveVertexRegion(newModel, config.vertex_location)
+                : config.vertex_location;
+            if (mismatch || (useVertex && newRegion !== config.vertex_location)) {
+                onChange({ ...config, llm_model: newModel, vertex_location: newRegion });
             }
         }
         prevVertexRef.current = useVertex;
     }, [config.use_vertex_ai]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const selectedModel = normalizeGoogleLiveModelForUi(config.llm_model);
+    const selectedRegion = config.vertex_location || 'us-central1';
+    const vertexRegionSupport = getGoogleLiveVertexRegionSupport(
+        config.llm_model,
+        Boolean(config.use_vertex_ai),
+        selectedRegion,
+    );
+    const regionOptions: VertexRegion[] = [
+        ...GOOGLE_LIVE_VERTEX_REGIONS,
+        ...regions.filter(region => !GOOGLE_LIVE_VERTEX_REGIONS.some(known => known.value === region.value)),
+    ];
+    const regionDocsUrl = selectedModel === 'gemini-3.8-live'
+        ? 'https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-8-live'
+        : 'https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-flash-live-api';
+    const handleModelChange = (model: string) => {
+        onChange({
+            ...config,
+            llm_model: model,
+            ...(model === 'gemini-3.8-live' ? { response_modalities: 'audio' } : {}),
+            ...(config.use_vertex_ai
+                ? { vertex_location: preferredGoogleLiveVertexRegion(model, config.vertex_location) }
+                : {}),
+        });
+    };
     const vertexUploadLabel = uploading
         ? 'Uploading...'
         : credentials?.uploaded && !credentials?.configured
@@ -227,8 +265,13 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
             setVerifyResult({ status: 'success', message: res.data.message || 'Credentials verified!' });
             // Auto-switch to a Vertex-compatible model on successful verification
             const currentModel = config.llm_model || '';
-            if (!currentModel.startsWith('gemini-live-')) {
-                onChange({ ...config, llm_model: 'gemini-live-2.5-flash-native-audio' });
+            if (!isGoogleLiveModelCompatible(currentModel, true)) {
+                const newModel = 'gemini-live-2.5-flash-native-audio';
+                onChange({
+                    ...config,
+                    llm_model: newModel,
+                    vertex_location: preferredGoogleLiveVertexRegion(newModel, config.vertex_location),
+                });
             }
         } catch (e: any) {
             setVerifyResult({ status: 'error', message: e.response?.data?.detail || 'Verification failed' });
@@ -264,10 +307,11 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         <>
                                             <strong>API Mode toggle</strong> — choose between Google's two Live API surfaces.
                                             <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                                <li><strong>Off (Developer API):</strong> <code>generativelanguage.googleapis.com</code> with a simple <code>GOOGLE_API_KEY</code>. Fastest setup; preview models.</li>
-                                                <li><strong>On (Vertex AI):</strong> <code>aiplatform.googleapis.com</code> with OAuth2/ADC via service-account JSON. GA models, enterprise quotas, fixed function-calling reliability.</li>
+                                                <li><strong>Off (Developer API):</strong> <code>generativelanguage.googleapis.com</code> with a <code>GOOGLE_API_KEY</code>.</li>
+                                                <li><strong>On (Vertex AI):</strong> <code>aiplatform.googleapis.com</code> with OAuth2/ADC via service-account JSON.</li>
+                                                <li><code>gemini-3.8-live</code> is available on both surfaces.</li>
                                             </ul>
-                                            Toggling auto-switches the model to the matching API group.
+                                            Toggling preserves models available on both APIs; surface-specific models switch to a compatible default.
                                         </>
                                     }
                                     link="https://ai.google.dev/gemini-api/docs/live"
@@ -276,7 +320,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </div>
                             <p className="text-xs text-muted-foreground mt-0.5">
                                 Connects to <code>aiplatform.googleapis.com</code> using OAuth2/ADC instead of an API key.
-                                Enables GA models with fixed function calling reliability.
+                                Supports GA models and enterprise authentication.
                             </p>
                         </div>
                     </div>
@@ -425,15 +469,14 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 </div>
                                 <div className="space-y-2">
                                     <div className="flex items-center gap-1.5">
-                                        <label className="text-sm font-medium">GCP Region</label>
+                                        <label htmlFor="google-live-vertex-region" className="text-sm font-medium">GCP Region</label>
                                         <HelpTooltip
                                             content={
                                                 <>
                                                     <strong>Vertex AI region</strong> — which GCP region serves the Live API endpoint.
                                                     <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                                        <li><code>us-central1</code> (Iowa) is the default and has the widest model availability</li>
-                                                        <li>Pick the region closest to your Asterisk PBX for lower round-trip latency</li>
-                                                        <li>Some preview models are only available in <code>us-central1</code></li>
+                                                        <li><code>us-central1</code> (Iowa) is supported by both GA Vertex Live models</li>
+                                                        <li>Unavailable regions are shown but cannot be selected for the chosen model</li>
                                                     </ul>
                                                 </>
                                             }
@@ -442,26 +485,47 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         />
                                     </div>
                                     <select
-                                        className="w-full p-2 rounded border border-input bg-background"
-                                        value={config.vertex_location || 'us-central1'}
+                                        id="google-live-vertex-region"
+                                        className={`w-full p-2 rounded border bg-background ${vertexRegionSupport === 'unsupported' ? 'border-red-500' : 'border-input'}`}
+                                        value={selectedRegion}
                                         onChange={(e) => handleChange('vertex_location', e.target.value)}
+                                        aria-invalid={vertexRegionSupport === 'unsupported'}
                                     >
-                                        {regions.length > 0 ? (
-                                            regions.map((region) => (
-                                                <option key={region.value} value={region.value}>
-                                                    {region.label}
-                                                </option>
-                                            ))
-                                        ) : (
-                                            <>
-                                                <option value="us-central1">US Central (Iowa)</option>
-                                                <option value="us-east1">US East (South Carolina)</option>
-                                                <option value="europe-west1">Europe West (Belgium)</option>
-                                                <option value="asia-northeast1">Asia Northeast (Tokyo)</option>
-                                            </>
+                                        {!regionOptions.some(region => region.value === selectedRegion) && (
+                                            <option value={selectedRegion} disabled>
+                                                {selectedRegion} — saved region is not in the catalog
+                                            </option>
                                         )}
+                                        {regionOptions.map((region) => {
+                                            const unsupported = getGoogleLiveVertexRegionSupport(selectedModel, true, region.value) === 'unsupported';
+                                            return (
+                                                <option key={region.value} value={region.value} disabled={unsupported}>
+                                                    {region.label}{unsupported ? ' — unavailable for selected model' : ''}
+                                                </option>
+                                            );
+                                        })}
                                     </select>
-                                    <p className="text-xs text-muted-foreground">Region for Vertex AI endpoint</p>
+                                    {vertexRegionSupport === 'unsupported' ? (
+                                        <p role="alert" className="text-xs text-red-600 flex items-start gap-1">
+                                            <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>
+                                                The selected Live model is not listed in {selectedRegion}. Choose a supported region before saving.{' '}
+                                                <a href={regionDocsUrl} target="_blank" rel="noopener noreferrer" className="underline">Google model regions ↗</a>
+                                            </span>
+                                        </p>
+                                    ) : vertexRegionSupport === 'unknown' ? (
+                                        <p role="status" className="text-xs text-amber-600 flex items-start gap-1">
+                                            <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>Region availability for this legacy or custom model is not verified; confirm with a Live session test.</span>
+                                        </p>
+                                    ) : vertexRegionSupport === 'supported' ? (
+                                        <p role="status" className="text-xs text-green-600 flex items-start gap-1">
+                                            <CheckCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>The selected Live model is listed in {selectedRegion}. Project access is still verified when a Live session starts.</span>
+                                        </p>
+                                    ) : (
+                                        <p className="text-xs text-muted-foreground">Region for Vertex AI endpoint</p>
+                                    )}
                                 </div>
                             </div>
                         </div>
@@ -543,15 +607,15 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="space-y-2">
                         <div className="flex items-center gap-1.5">
-                            <label className="text-sm font-medium">LLM Model</label>
+                            <label htmlFor="google-live-llm-model" className="text-sm font-medium">LLM Model</label>
                             <HelpTooltip
                                 content={
                                     <>
                                         <strong>Gemini Live model</strong> — pricing ~1.5¢/min, sub-second response latency, 24+ language coverage.
                                         <ul className="list-disc pl-4 mt-1 space-y-0.5">
                                             <li><code>gemini-live-2.5-flash-native-audio</code> — Vertex AI GA, recommended for production</li>
-                                            <li><code>gemini-2.5-flash-preview-native-audio-dialog</code> — Developer API preview with native-audio dialog tuning</li>
-                                            <li>Models are scoped to their API group — switching Use Vertex AI auto-swaps to a compatible model</li>
+                                            <li><code>gemini-3.8-live</code> — GA on both APIs; test calls before production use</li>
+                                            <li>Switching Use Vertex AI keeps shared models and auto-swaps incompatible models</li>
                                         </ul>
                                     </>
                                 }
@@ -560,13 +624,14 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             />
                         </div>
                         <select
+                            id="google-live-llm-model"
                             className="w-full p-2 rounded border border-input bg-background"
                             value={selectedModel}
-                            onChange={(e) => handleChange('llm_model', e.target.value)}
+                            onChange={(e) => handleModelChange(e.target.value)}
                         >
                             {GOOGLE_LIVE_MODEL_GROUPS.map((group) => {
                                 const isVertexGroup = group.label === 'Vertex AI Live API';
-                                const isActiveGroup = config.use_vertex_ai ? isVertexGroup : !isVertexGroup;
+                                const isActiveGroup = group.label === 'Both Google APIs' || (config.use_vertex_ai ? isVertexGroup : !isVertexGroup);
                                 return (
                                     <optgroup key={group.label} label={group.label}>
                                         {group.options.map((modelOption) => (
@@ -1003,7 +1068,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                         </div>
                         <div className="space-y-2">
                             <div className="flex items-center gap-1.5">
-                                <label className="text-sm font-medium">Response Modalities</label>
+                                <label htmlFor="google_live_response_modalities" className="text-sm font-medium">Response Modalities</label>
                                 <HelpTooltip
                                     content={
                                         <>
@@ -1012,6 +1077,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                                 <li><strong>Audio Only</strong> (default for voice) — TTS is generated server-side</li>
                                                 <li><strong>Text Only</strong> — no TTS; useful for chat-style integrations or external TTS pipelines</li>
                                                 <li><strong>Audio &amp; Text</strong> — both streams; enables real-time transcript display alongside playback</li>
+                                                <li><strong>Gemini 3.8 Live</strong> supports Audio Only; enable output transcription below for text.</li>
                                             </ul>
                                         </>
                                     }
@@ -1020,14 +1086,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 />
                             </div>
                             <select
+                                id="google_live_response_modalities"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.response_modalities || 'audio'}
+                                value={selectedModel === 'gemini-3.8-live' ? 'audio' : (config.response_modalities || 'audio')}
                                 onChange={(e) => handleChange('response_modalities', e.target.value)}
+                                disabled={selectedModel === 'gemini-3.8-live'}
                             >
                                 <option value="audio">Audio Only</option>
                                 <option value="text">Text Only</option>
                                 <option value="audio_text">Audio & Text</option>
                             </select>
+                            {selectedModel === 'gemini-3.8-live' && (
+                                <p className="text-xs text-muted-foreground">
+                                    Gemini 3.8 Live requires Audio Only. Enable output transcription below for text.
+                                </p>
+                            )}
                         </div>
                         <div className="flex items-center space-x-2">
                             <input
