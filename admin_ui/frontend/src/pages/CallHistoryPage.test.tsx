@@ -274,4 +274,48 @@ describe('CallHistoryPage deep links', () => {
             expect(callsRequest?.[1]).toMatchObject({ params: { page: 1 } });
         });
     });
+
+    it('hides selected outcomes in the list, the stats and the exports', async () => {
+        const defaultGet = vi.mocked(axios.get).getMockImplementation()!;
+        vi.mocked(axios.get).mockImplementation(async (url, config) => {
+            if (url === '/api/calls/filters') {
+                return { data: { providers: [], pipelines: [], contexts: [], outcomes: ['completed', 'abandoned'] } };
+            }
+            if (typeof url === 'string' && url.startsWith('/api/calls/export/')) return { data: new Blob() };
+            return defaultGet(url, config);
+        });
+        window.URL.createObjectURL = vi.fn(() => 'blob:test');
+        window.URL.revokeObjectURL = vi.fn();
+        const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+        render(
+            <MemoryRouter initialEntries={['/history']}>
+                <CallHistoryPage />
+            </MemoryRouter>
+        );
+
+        fireEvent.click(await screen.findByTitle('Filters'));
+        fireEvent.click(screen.getByRole('button', { name: 'Hide' }));
+        fireEvent.click(await screen.findByLabelText('abandoned'));
+
+        const lastParams = (url: string) => vi.mocked(axios.get).mock.calls
+            .filter(([u]) => u === url)
+            .slice(-1)[0]?.[1]?.params;
+        await waitFor(() => {
+            expect(lastParams('/api/calls')).toMatchObject({ exclude_outcome: 'abandoned', page: 1 });
+            expect(lastParams('/api/calls/stats')).toEqual({ exclude_outcome: 'abandoned' });
+        });
+        expect(lastParams('/api/calls')).not.toHaveProperty('outcome');
+
+        fireEvent.click(screen.getByRole('button', { name: /CSV/ }));
+        await waitFor(() => {
+            expect(lastParams('/api/calls/export/csv')).toEqual({ exclude_outcome: 'abandoned' });
+        });
+        downloadClick.mockRestore();
+
+        fireEvent.click(screen.getByText('Clear all'));
+        await waitFor(() => {
+            expect(lastParams('/api/calls/stats')).toEqual({});
+        });
+    });
 });
