@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import axios from 'axios';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -321,6 +321,38 @@ describe('CallHistoryPage deep links', () => {
         await waitFor(() => {
             expect(lastParams('/api/calls/stats')).toEqual({});
         });
+    });
+
+    it('keeps the latest statistics when an older request resolves last', async () => {
+        const get = vi.mocked(axios.get).getMockImplementation()!;
+        const pending = new Map<string, (value: unknown) => void>();
+        const statsFor = (total: number) => ({ data: { total_calls: total, outcomes: {}, providers: {}, top_tools: {} } });
+        vi.mocked(axios.get).mockImplementation(async (url, config) => {
+            if (url === '/api/calls/stats') {
+                const caller = (config?.params as Record<string, string> | undefined)?.caller_name;
+                if (!caller) return statsFor(5);
+                return new Promise(resolve => pending.set(caller, resolve));
+            }
+            return get(url, config);
+        });
+
+        render(<MemoryRouter initialEntries={['/history']}><CallHistoryPage /></MemoryRouter>);
+        expect(await screen.findByText('5')).toBeInTheDocument();
+
+        fireEvent.click(screen.getByTitle('Filters'));
+        const callerName = screen.getByPlaceholderText('Name');
+        fireEvent.change(callerName, { target: { value: 'Alice' } });
+        await waitFor(() => expect(pending.has('Alice')).toBe(true));
+        fireEvent.change(callerName, { target: { value: 'Bob' } });
+        await waitFor(() => expect(pending.has('Bob')).toBe(true));
+
+        // Responses arrive in reverse order: Bob (current filter) first, then Alice (stale).
+        await act(async () => { pending.get('Bob')!(statsFor(222)); });
+        expect(await screen.findByText('222')).toBeInTheDocument();
+        await act(async () => { pending.get('Alice')!(statsFor(111)); });
+
+        expect(screen.getByText('222')).toBeInTheDocument();
+        expect(screen.queryByText('111')).not.toBeInTheDocument();
     });
 
     it('keeps the empty-history message distinct from an empty filter result', async () => {

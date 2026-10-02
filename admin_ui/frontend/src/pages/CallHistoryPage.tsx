@@ -378,13 +378,17 @@ const CallHistoryPage = () => {
         }
     }, [page, pageSize, filterParams]);
 
+    // Filter edits fire overlapping stats requests; only the latest one may update the cards.
+    const statsRequestId = useRef(0);
+
     const fetchStats = useCallback(async () => {
+        const requestId = ++statsRequestId.current;
         try {
             // Stats follow every active filter so the cards describe the listed calls.
             const res = await axios.get('/api/calls/stats', { params: filterParams });
-            setStats(res.data);
+            if (requestId === statsRequestId.current) setStats(res.data);
         } catch (err) {
-            console.error('Failed to fetch stats:', err);
+            if (requestId === statsRequestId.current) console.error('Failed to fetch stats:', err);
         }
     }, [filterParams]);
 
@@ -425,6 +429,10 @@ const CallHistoryPage = () => {
 
     useEffect(() => {
         fetchStats();
+        return () => {
+            // Invalidate the pending request when the filters change or the page unmounts.
+            statsRequestId.current += 1;
+        };
     }, [fetchStats]);
 
     useEffect(() => {
