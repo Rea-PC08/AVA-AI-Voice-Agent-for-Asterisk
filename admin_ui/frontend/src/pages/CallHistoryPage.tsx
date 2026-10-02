@@ -355,7 +355,10 @@ const CallHistoryPage = () => {
         setPage(1);
     }, []);
 
+    const callsRequestId = useRef(0);
+
     const fetchCalls = useCallback(async () => {
+        const requestId = ++callsRequestId.current;
         try {
             setLoading(true);
             setError(null);
@@ -367,14 +370,16 @@ const CallHistoryPage = () => {
             };
 
             const res = await axios.get('/api/calls', { params });
+            if (requestId !== callsRequestId.current) return;
             setCalls(res.data.calls);
             setTotal(res.data.total);
             setTotalPages(res.data.total_pages);
         } catch (err: any) {
+            if (requestId !== callsRequestId.current) return;
             console.error('Failed to fetch calls:', err);
             setError(err?.response?.data?.detail || 'Failed to load call history');
         } finally {
-            setLoading(false);
+            if (requestId === callsRequestId.current) setLoading(false);
         }
     }, [page, pageSize, filterParams]);
 
@@ -425,6 +430,9 @@ const CallHistoryPage = () => {
 
     useEffect(() => {
         fetchCalls();
+        return () => {
+            callsRequestId.current += 1;
+        };
     }, [fetchCalls]);
 
     useEffect(() => {

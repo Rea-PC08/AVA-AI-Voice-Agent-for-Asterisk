@@ -323,6 +323,68 @@ describe('CallHistoryPage deep links', () => {
         });
     });
 
+    it('keeps the latest calls and pagination when an older request resolves last', async () => {
+        const get = vi.mocked(axios.get).getMockImplementation()!;
+        const pending = new Map<string, (value: unknown) => void>();
+        vi.mocked(axios.get).mockImplementation(async (url, config) => {
+            if (url === '/api/calls') {
+                const caller = (config?.params as Record<string, string> | undefined)?.caller_name;
+                if (caller) return new Promise(resolve => pending.set(caller, resolve));
+            }
+            return get(url, config);
+        });
+
+        render(<MemoryRouter initialEntries={['/history']}><CallHistoryPage /></MemoryRouter>);
+        expect(await screen.findByText('Alice')).toBeInTheDocument();
+        fireEvent.click(screen.getByTitle('Filters'));
+        const callerName = screen.getByPlaceholderText('Name');
+        fireEvent.change(callerName, { target: { value: 'Alice' } });
+        await waitFor(() => expect(pending.has('Alice')).toBe(true));
+        fireEvent.change(callerName, { target: { value: 'Bob' } });
+        await waitFor(() => expect(pending.has('Bob')).toBe(true));
+
+        await act(async () => { pending.get('Bob')!({ data: {
+            calls: [{ ...callDetail, id: 'record-bob', caller_name: 'Bob' }], total: 1, total_pages: 1,
+        } }); });
+        expect(await screen.findByText('Bob')).toBeInTheDocument();
+        await act(async () => { pending.get('Alice')!({ data: { calls: [callDetail], total: 51, total_pages: 3 } }); });
+
+        expect(screen.getByText('Bob')).toBeInTheDocument();
+        expect(screen.queryByText('Alice')).not.toBeInTheDocument();
+        expect(screen.getByText('Page 1 of 1')).toBeInTheDocument();
+        expect(screen.getByText('Showing 1 to 1 of 1 calls')).toBeInTheDocument();
+    });
+
+    it('ignores an older list failure while the current request is still loading', async () => {
+        const get = vi.mocked(axios.get).getMockImplementation()!;
+        const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: unknown) => void }>();
+        vi.mocked(axios.get).mockImplementation(async (url, config) => {
+            if (url === '/api/calls') {
+                const caller = (config?.params as Record<string, string> | undefined)?.caller_name;
+                if (caller) return new Promise((resolve, reject) => pending.set(caller, { resolve, reject }));
+            }
+            return get(url, config);
+        });
+
+        render(<MemoryRouter initialEntries={['/history']}><CallHistoryPage /></MemoryRouter>);
+        expect(await screen.findByText('Alice')).toBeInTheDocument();
+        fireEvent.click(screen.getByTitle('Filters'));
+        const callerName = screen.getByPlaceholderText('Name');
+        fireEvent.change(callerName, { target: { value: 'Alice' } });
+        await waitFor(() => expect(pending.has('Alice')).toBe(true));
+        fireEvent.change(callerName, { target: { value: 'Bob' } });
+        await waitFor(() => expect(pending.has('Bob')).toBe(true));
+
+        await act(async () => { pending.get('Alice')!.reject({ response: { data: { detail: 'Obsolete Alice failure' } } }); });
+        expect(screen.queryByText('Obsolete Alice failure')).not.toBeInTheDocument();
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+
+        await act(async () => { pending.get('Bob')!.resolve({ data: {
+            calls: [{ ...callDetail, id: 'record-bob', caller_name: 'Bob' }], total: 1, total_pages: 1,
+        } }); });
+        expect(await screen.findByText('Bob')).toBeInTheDocument();
+    });
+
     it('keeps the latest statistics when an older request resolves last', async () => {
         const get = vi.mocked(axios.get).getMockImplementation()!;
         const pending = new Map<string, (value: unknown) => void>();
